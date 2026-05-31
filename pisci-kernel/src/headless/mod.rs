@@ -127,6 +127,21 @@ pub async fn run_pisci_turn(
     request: HeadlessCliRequest,
     deps: HeadlessDeps,
 ) -> Result<HeadlessCliResponse> {
+    run_pisci_turn_cancellable(request, deps, Arc::new(AtomicBool::new(false))).await
+}
+
+/// Like [`run_pisci_turn`] but driven by a caller-owned `cancel` flag.
+///
+/// Hosts that want to *stop* an in-flight turn (e.g. a desktop "Stop" button)
+/// keep a clone of `cancel` and flip it to `true`; the agent loop observes it
+/// via the shared [`ToolContext::cancel`] and unwinds cleanly, emitting
+/// `Cancelled`/`Done`. Passing a fresh flag is equivalent to
+/// [`run_pisci_turn`].
+pub async fn run_pisci_turn_cancellable(
+    request: HeadlessCliRequest,
+    deps: HeadlessDeps,
+    cancel: Arc<AtomicBool>,
+) -> Result<HeadlessCliResponse> {
     if !matches!(request.mode, HeadlessCliMode::Pisci) {
         return Err(anyhow!(
             "run_pisci_turn only supports mode=pisci (got {:?}). Use \
@@ -296,7 +311,8 @@ pub async fn run_pisci_turn(
     let agent = harness.into_agent_loop(client, None, None);
 
     // ── Tool context ───────────────────────────────────────────────────
-    let cancel = Arc::new(AtomicBool::new(false));
+    // `cancel` is supplied by the caller so an external "Stop" can unwind the
+    // agent loop mid-run; the timeout path below also flips it.
     let workspace_buf = PathBuf::from(&workspace_root);
     let max_iterations = {
         let s = settings.lock().await;
