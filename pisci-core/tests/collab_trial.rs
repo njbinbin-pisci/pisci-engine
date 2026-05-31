@@ -760,9 +760,8 @@ fn convergence_silent_dormant_state_does_not_raise_attention() {
 
 #[test]
 fn convergence_collect_pool_attention_ignores_already_seen_events() {
-    // Heartbeat cursor must advance: once an attention event has been seen,
-    // it should not re-fire. Otherwise the pool never drains and heartbeat
-    // oscillates instead of converging.
+    // Cursor advancement should stop re-counting the same attention event,
+    // even when supervisor attention remains active for org_spec follow-up.
     let base = Utc.with_ymd_and_hms(2026, 4, 17, 10, 0, 0).unwrap();
     let pool = sample_pool();
     let messages = vec![message_at(
@@ -779,11 +778,44 @@ fn convergence_collect_pool_attention_ignores_already_seen_events() {
     let first = collect_pool_attention(&pool, &messages, &todos, &koi_ids, 0)
         .expect("first scan must raise attention");
     assert_eq!(first.latest_message_id, 7);
+    assert!(first.summary.contains("Recent attention events: 1"));
 
-    let second = collect_pool_attention(&pool, &messages, &todos, &koi_ids, 7);
+    let second = collect_pool_attention(&pool, &messages, &todos, &koi_ids, 7)
+        .expect("supervisor follow-up may remain active");
     assert!(
-        second.is_none(),
-        "after advancing the cursor past the @pisci mention, heartbeat must stay quiet"
+        second.summary.contains("Recent attention events: 0"),
+        "cursor must not re-ingest the same @pisci mention as a fresh event"
+    );
+}
+
+#[test]
+fn convergence_supervisor_required_stays_on_radar_after_cursor_advances() {
+    // Board can be quiet while org_spec is still unfinished; do not suppress
+    // supervisor attention just because @pisci was mentioned earlier.
+    let base = Utc.with_ymd_and_hms(2026, 4, 17, 10, 0, 0).unwrap();
+    let pool = sample_pool();
+    let messages = vec![message_at(
+        7,
+        at_ms(base, 0),
+        "koi-1",
+        "@pisci please take a look",
+        json!({}),
+        None,
+    )];
+    let todos = vec![todo_at("done", at_ms(base, 0))];
+    let koi_ids = vec!["koi-1".to_string()];
+
+    let first = collect_pool_attention(&pool, &messages, &todos, &koi_ids, 0).expect("first scan");
+    assert_eq!(
+        first.assessment.decision,
+        ProjectDecision::SupervisorDecisionRequired
+    );
+
+    let second = collect_pool_attention(&pool, &messages, &todos, &koi_ids, 7)
+        .expect("supervisor-required pools must keep heartbeat attention");
+    assert_eq!(
+        second.assessment.decision,
+        ProjectDecision::SupervisorDecisionRequired
     );
 }
 

@@ -598,32 +598,31 @@ fn default_heartbeat_enabled() -> bool {
     true
 }
 pub fn default_heartbeat_prompt() -> String {
-    "这是你的例行心跳巡查。按以下清单逐项完成，然后回复 HEARTBEAT_OK。\n\n\
+    "这是你的例行心跳巡查。你的职责是**监督项目是否按 org_spec 收敛**，而不是只扫一眼任务板有没有未完成任务。\n\n\
+     ## 0. 硬性门禁（未通过不得回复 HEARTBEAT_OK）\n\
+     对每个 active 项目池，你必须按顺序完成：\n\
+     1) pool_org(action=\"read\", pool_id=...) — **完整阅读** org_spec；\n\
+     2) pool_org(action=\"get_todos\", pool_id=...) + pool_org(action=\"get_messages\", pool_id=...)；\n\
+     3) 用你自己的推理对照 org_spec：当前交付物、任务分解、消息记录是否已满足规约中的**全部**要求（含多阶段/多里程碑/角色分工/验收标准等，以 org_spec 原文为准，不要臆测阶段编号）。\n\n\
+     **禁止**在以下任一情况仅回复 HEARTBEAT_OK 或“无需干预”：\n\
+     - 未对该池执行过 pool_org(read)；\n\
+     - 任务板看似“全 done”但 org_spec 中仍有未覆盖的工作项、后续阶段、未分配角色或未验收交付物；\n\
+     - 仅完成了规约中的早期步骤，后续步骤在 org_spec 中有描述但板上无对应 todo/无进展消息；\n\
+     - 存在 needs_review / blocked / task_failed 未处理。\n\n\
+     若 org_spec 未收敛：必须 pool_org(action=\"post_status\") 写明差距与下一步，并用 pool_org(action=\"create_todo\") 或 pool_org(action=\"assign_koi\") **落实**后续工作；不得只提醒不派活。\n\n\
      ## 1. 活跃项目巡查\n\
-     用 pool_org(action=\"list\") 列出所有项目池。对每个 active 的池：\n\
-     - pool_org(action=\"get_todos\", pool_id=...) — 查看任务板状态\n\
-     - pool_org(action=\"get_messages\", pool_id=...) — 阅读最新消息\n\n\
-     根据任务板状态判断并执行：\n\
-     - 若存在 needs_review 任务：这不是“无需干预”。必须审查消息和产物，然后选择：合并可接受的分支、恢复/替换/重新分配需返工任务，或用 pool_org(action=\"post_status\") 写明为什么需要用户人工判断。\n\
-     - 若所有 todo 状态均为 done 或 cancelled（无 todo/in_progress/blocked）：\n\
-       不要自动归档。先用 pool_org(action=\"post_status\") 发送收尾总结，明确说明项目已进入“待用户确认归档”状态；只有用户明确要求归档时，Pisci 才能执行 pool_org(action=\"archive\", pool_id=...)。\n\
-     - 若有 blocked 任务：主动解除阻塞或重新分配。\n\
-     - 若 Koi 在空转讨论无产出：用 pool_org(action=\"post_status\") 推动下一步，或用 pool_org(action=\"assign_koi\") 分配具体任务。\n\
-     - 若项目卡住无进展：介入协调。\n\n\
-     ⚠️ 重要：在心跳巡查中，**绝对不要创建新的项目池**。\n\
-     如果需要追加工作，应在现有项目池中用 pool_org(action=\"create_todo\") 创建任务，\n\
-     或通过 pool_org(action=\"assign_koi\") 分配给相关 Koi。\n\
-     只有用户明确要求启动新项目时，才能创建新的项目池。\n\n\
-     ## 2. Koi 状态检查\n\
-     查看是否有 Koi 异常（长时间 busy 但无活跃 todo）。如有，用 pool_org(action=\"post_status\") 说明，或分配新任务。\n\n\
-     ## 3. 检查项目规约\n\
-     对每个 active 池，用 pool_org(action=\"read\", pool_id=...) 阅读 org_spec（项目规约），对照 get_todos / get_messages 判断项目是否按规约推进、是否已收敛：\n\
-     - 若交付物、任务分解或协作节奏明显偏离 org_spec：用 pool_org(action=\"post_status\") 指出差距，并通过 pool_org(action=\"create_todo\") 或 pool_org(action=\"assign_koi\") 安排继续推进或迭代（补全缺失步骤、返工、拆分下一里程碑）。\n\
-     - 若规约要求的能力/角色尚未落地但板面已停滞：主动分配具体 todo，不要只发空泛提醒。\n\
-     - 若项目已按规约完成且板面干净：在 post_status 中说明收敛情况；勿自动归档（见第 1 节）。\n\n\
-     ## 4. 定时任务检查\n\
-     用 app_control(action=\"list_scheduled_tasks\") 查看是否有应运行的计划任务，按需处理。\n\n\
-     完成以上全部巡查且已处理所有 needs_review/blocked/停滞/规约偏差后，回复 HEARTBEAT_OK。"
+     用 pool_org(action=\"list\") 列出所有 active 池，对每个池完成 §0 后按板面行动：\n\
+     - needs_review：审查产物后合并分支、返工（resume/replace/assign_koi）或 post_status 说明需人工决策；\n\
+     - blocked：解除阻塞或改派；\n\
+     - 无活跃 todo 但 org_spec 未收敛（常见：只做完了第一阶段）：按 org_spec 拆下一批 todo 并 assign_koi，禁止把项目晾在那里；\n\
+     - 无活跃 todo 且 org_spec 已收敛：post_status 说明收敛与待用户确认归档，**勿**自动 archive；\n\
+     - Koi 空转：post_status 定方向或 assign_koi。\n\n\
+     ⚠️ 心跳中**禁止** pool_org(action=\"create\") 新建项目池；追加工作只在现有池 create_todo / assign_koi。\n\n\
+     ## 2. Koi 状态\n\
+     长时间 busy 且无活跃 todo：post_status 或 assign_koi。\n\n\
+     ## 3. 定时任务\n\
+     app_control(action=\"list_scheduled_tasks\")，按需处理。\n\n\
+     仅当：§0 对每个 active 池均已执行且 needs_review/blocked/失败/规约缺口均已处理或已派活后，才可回复 HEARTBEAT_OK。"
         .into()
 }
 

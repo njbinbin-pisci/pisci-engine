@@ -103,15 +103,15 @@ pub fn build_pool_heartbeat_message(base_prompt: &str, attention: &PoolAttention
         }
         ProjectDecision::SupervisorDecisionRequired => {
             lines.push(
-                "The worker agents appear locally finished, but no worker can make the final global judgment for the project."
+                "Workers look locally finished; the task board alone is NOT proof the project converged under org_spec."
                     .to_string(),
             );
             lines.push(
-                "Pisci must now inspect the pool evidence and decide the next step explicitly: coordinate more work, request clarification, or treat the project as ready for Pisci's own review."
+                "Mandatory before HEARTBEAT_OK: pool_org(action=\"read\") for this pool, then get_todos + get_messages. Compare all org_spec requirements (phases, milestones, roles, deliverables — whatever the spec text says) against board evidence."
                     .to_string(),
             );
             lines.push(
-                "Do NOT collapse this state into a fixed canned outcome. Use the org_spec, recent pool_org(get_messages) evidence, and deliverables to decide whether the project truly converged or whether the task decomposition missed something."
+                "If org_spec still has uncovered work (e.g. early milestones done but later ones never decomposed into todos): pool_org(post_status) stating the gap, then create_todo / assign_koi for the next concrete steps. Do NOT reply HEARTBEAT_OK while the spec is unfinished."
                     .to_string(),
             );
             lines.push(
@@ -160,7 +160,7 @@ pub fn build_pool_heartbeat_message(base_prompt: &str, attention: &PoolAttention
 
     lines.push(String::new());
     lines.push(
-        "Use your judgment. Read the pool context, then take whatever action best serves the project."
+        "Do not treat a quiet board as success. Read org_spec via pool_org(read), then act or document why HEARTBEAT_OK is justified."
             .to_string(),
     );
     lines.join("\n")
@@ -194,12 +194,8 @@ pub fn collect_pool_attention(
     {
         return None;
     }
-    if new_attention_messages.is_empty()
-        && assessment.decision == ProjectDecision::SupervisorDecisionRequired
-        && has_historic_pisci_route
-    {
-        return None;
-    }
+    // Do not suppress supervisor attention after a prior @pisci mention: the board
+    // may be quiet while org_spec is still unfinished (e.g. only early milestones done).
     if new_attention_messages.is_empty()
         && assessment.decision == ProjectDecision::Continue
         && !has_state_attention
