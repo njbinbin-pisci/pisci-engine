@@ -310,6 +310,7 @@ fn collab_trial_build_pool_heartbeat_message_keeps_no_archive_instruction() {
             attention_reasons: vec!["Project is ready for Pisci review".into()],
             summary: "Project looks ready".into(),
         },
+        org_spec_excerpt: None,
     };
 
     let message = build_pool_heartbeat_message("Base prompt", &attention);

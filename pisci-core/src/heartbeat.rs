@@ -12,6 +12,50 @@ pub struct PoolAttention {
     pub session_id: String,
     pub summary: String,
     pub assessment: ProjectAssessment,
+    /// Truncated org_spec text for convergence checks (data injection, not flow rules).
+    pub org_spec_excerpt: Option<String>,
+}
+
+/// True when the host assessment says Pisci should coordinate, not merely ack.
+pub fn assessment_requires_coordination(assessment: &ProjectAssessment) -> bool {
+    !matches!(assessment.decision, ProjectDecision::Continue)
+        || assessment.needs_review_count > 0
+        || assessment.blocked_todo_count > 0
+}
+
+/// Detect heartbeat turns that ended without observable pool coordination.
+pub fn is_heartbeat_ack_only(response: &str) -> bool {
+    let trimmed = response.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let lower = trimmed.to_lowercase();
+    let short = trimmed.chars().count() <= 240;
+    short
+        && (lower.contains("heartbeat_ok")
+            || lower.contains("无需干预")
+            || lower.contains("no intervention")
+            || lower.contains("no change"))
+}
+
+/// State-derived supervisor note when a heartbeat turn did not touch the pool.
+pub fn build_heartbeat_coordination_gap_notice(attention: &PoolAttention) -> String {
+    let reasons = if attention.assessment.attention_reasons.is_empty() {
+        attention.assessment.summary.clone()
+    } else {
+        attention.assessment.attention_reasons.join("; ")
+    };
+    format!(
+        "[Heartbeat patrol · state trigger]\n\
+         Decision: {:?}\n\
+         Assessment: {}\n\
+         Attention: {}\n\
+         This note was posted because the heartbeat turn did not produce any new Pisci pool activity. \
+         Compare org_spec against board evidence and coordinate via pool_org (post_status / create_todo / assign_koi) as appropriate.",
+        attention.assessment.decision,
+        attention.assessment.summary,
+        reasons,
+    )
 }
 
 fn preview_chars(content: &str, max_chars: usize) -> String {
@@ -79,6 +123,14 @@ pub fn build_pool_heartbeat_message(base_prompt: &str, attention: &PoolAttention
                 .iter()
                 .map(|reason| format!("- {}", reason)),
         );
+    }
+    if let Some(org_spec) = attention.org_spec_excerpt.as_deref() {
+        lines.extend([
+            String::new(),
+            "## Project org_spec (convergence reference)".to_string(),
+            "- Compare ALL phases/milestones/deliverables in this text against pool_org evidence — not just whether todos are done.".to_string(),
+            org_spec.to_string(),
+        ]);
     }
     lines.extend([String::new(), "## Guidance".to_string()]);
 
@@ -223,6 +275,15 @@ pub fn collect_pool_attention(
         ));
     }
 
+    let org_spec_excerpt = {
+        let trimmed = pool.org_spec.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(preview_chars(trimmed, 4000))
+        }
+    };
+
     Some(PoolAttention {
         pool_id: pool.id.clone(),
         pool_name: pool.name.clone(),
@@ -230,6 +291,7 @@ pub fn collect_pool_attention(
         session_id: pool_pisci_session_id(&pool.id),
         summary: lines.join("\n"),
         assessment,
+        org_spec_excerpt,
     })
 }
 

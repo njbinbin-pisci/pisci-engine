@@ -454,6 +454,19 @@ fn koi_timeout_for_todo(koi: &KoiDefinition, todo_timeout_secs: u32, default_sec
     }
 }
 
+/// Board states that already satisfy the Stop Gate without `complete_todo`.
+fn is_todo_board_reconciled(status: &str) -> bool {
+    matches!(status, "done" | "blocked" | "cancelled" | "needs_review")
+}
+
+async fn refresh_todo(
+    store: &PoolStore,
+    todo_id: &str,
+) -> anyhow::Result<Option<KoiTodo>> {
+    let lookup = todo_id.to_string();
+    store.read(move |db| db.get_koi_todo(&lookup)).await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn record_turn_outcome(
     store: &PoolStore,
@@ -468,11 +481,14 @@ async fn record_turn_outcome(
     // Re-read the todo to see if the subagent already called
     // `pool_org(action="complete_todo")` — that tool sets `status="done"`
     // directly, so we must not overwrite it with `needs_review`.
-    let todo_id = todo.id.clone();
-    let current = store.read(move |db| db.get_koi_todo(&todo_id)).await?;
-    let todo_already_done = current
+    let mut current = refresh_todo(store, &todo.id).await?;
+    let mut todo_already_done = current
         .as_ref()
         .map(|t| t.status == "done")
+        .unwrap_or(false);
+    let mut todo_already_reconciled = current
+        .as_ref()
+        .map(|t| is_todo_board_reconciled(&t.status))
         .unwrap_or(false);
 
     let explicitly_completed = if let Some(psid) = pool_id {
@@ -491,7 +507,7 @@ async fn record_turn_outcome(
     };
     let test_mode_completed =
         run_success && pool_id.is_none() && raw_reply.starts_with("[TestMode]");
-    let completion_recorded = explicitly_completed || test_mode_completed;
+    let mut completion_recorded = explicitly_completed || test_mode_completed;
 
     let result_msg_id = if let Some(psid) = pool_id {
         if run_success && raw_reply.trim().is_empty() && explicitly_completed {
@@ -508,6 +524,29 @@ async fn record_turn_outcome(
                 })
                 .await?;
             if let Some(msg_id) = existing {
+                // The Koi posted a pool result but exited on a tool call without
+                // calling `complete_todo`. Close the loop instead of leaving the
+                // todo stuck in `in_progress`.
+                if current
+                    .as_ref()
+                    .map(|t| t.status == "in_progress")
+                    .unwrap_or(false)
+                {
+                    let todo_id_complete = todo.id.clone();
+                    store
+                        .write(move |db| db.complete_koi_todo(&todo_id_complete, Some(msg_id)))
+                        .await?;
+                    current = refresh_todo(store, &todo.id).await?;
+                    todo_already_done = current
+                        .as_ref()
+                        .map(|t| t.status == "done")
+                        .unwrap_or(false);
+                    todo_already_reconciled = current
+                        .as_ref()
+                        .map(|t| is_todo_board_reconciled(&t.status))
+                        .unwrap_or(false);
+                    completion_recorded = true;
+                }
                 let psid_lookup = psid.to_string();
                 if let Some(msg) = store
                     .read(move |db| db.get_pool_message_by_id(msg_id))
@@ -548,7 +587,7 @@ async fn record_turn_outcome(
                 message: (&msg).into(),
             });
             Some(msg.id)
-        } else if !todo_already_done && !completion_recorded {
+        } else if !todo_already_done && !completion_recorded && !todo_already_reconciled {
             let koi_output = if raw_reply.chars().count() > 5000 {
                 format!("{}...", truncate_chars(raw_reply, 5000))
             } else {
@@ -611,7 +650,21 @@ async fn record_turn_outcome(
         None
     };
 
-    if !todo_already_done {
+    // The Koi may have reconciled the board during the turn (Waiter:
+    // `blocked` / `cancel_todo`). Re-read before applying the safety net.
+    if !todo_already_reconciled {
+        current = refresh_todo(store, &todo.id).await?;
+        todo_already_reconciled = current
+            .as_ref()
+            .map(|t| is_todo_board_reconciled(&t.status))
+            .unwrap_or(false);
+        todo_already_done = current
+            .as_ref()
+            .map(|t| t.status == "done")
+            .unwrap_or(false);
+    }
+
+    if !todo_already_done && !todo_already_reconciled {
         let todo_id = todo.id.clone();
         let reply_for_block = raw_reply.to_string();
         let rmid = result_msg_id;
@@ -636,6 +689,18 @@ async fn record_turn_outcome(
         TodoChangeAction::Completed
     } else if !run_success {
         TodoChangeAction::Blocked
+    } else if current
+        .as_ref()
+        .map(|t| t.status == "blocked")
+        .unwrap_or(false)
+    {
+        TodoChangeAction::Blocked
+    } else if current
+        .as_ref()
+        .map(|t| t.status == "needs_review")
+        .unwrap_or(false)
+    {
+        TodoChangeAction::Updated
     } else {
         TodoChangeAction::Updated
     };
@@ -1585,5 +1650,15 @@ mod tests {
             .map(|target| target.koi.id.as_str())
             .collect();
         assert_eq!(ids, vec!["b"]);
+    }
+
+    #[test]
+    fn board_reconciled_treats_blocked_waiter_exit_as_terminal() {
+        assert!(is_todo_board_reconciled("blocked"));
+        assert!(is_todo_board_reconciled("cancelled"));
+        assert!(is_todo_board_reconciled("done"));
+        assert!(is_todo_board_reconciled("needs_review"));
+        assert!(!is_todo_board_reconciled("in_progress"));
+        assert!(!is_todo_board_reconciled("todo"));
     }
 }
