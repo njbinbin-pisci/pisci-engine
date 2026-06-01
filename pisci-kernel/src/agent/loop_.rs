@@ -774,8 +774,7 @@ impl DefaultCompaction {
         let static_overhead_tokens =
             crate::llm::estimate_request_overhead_tokens(Some(req.system_prompt), req.tool_defs);
         let message_budget = total_budget.saturating_sub(static_overhead_tokens);
-        let single_limit =
-            (message_budget as f64 * CONTEXT_SINGLE_RESULT_SHARE * 4.0) as usize;
+        let single_limit = (message_budget as f64 * CONTEXT_SINGLE_RESULT_SHARE * 4.0) as usize;
 
         let mut messages = req.messages;
         let mut rolling_summary = req.rolling_summary.to_string();
@@ -854,7 +853,11 @@ impl DefaultCompaction {
                 );
                 info!(
                     "proactive summarisation pass={} complete: {} → {} messages, tokens {} → {}",
-                    pass + 1, messages.len(), compacted.messages.len(), estimated, new_estimated,
+                    pass + 1,
+                    messages.len(),
+                    compacted.messages.len(),
+                    estimated,
+                    new_estimated,
                 );
                 rolling_summary = compacted.summary;
                 messages = compacted.messages;
@@ -1866,139 +1869,141 @@ impl AgentLoop {
             super::tool::ToolResult::err(reason)
         } else {
             match self.registry.get(name) {
-            Some(tool) => {
-                // Log key input fields to aid debugging (path, command, query, etc.)
-                let input_hint = match name {
-                    "file_read" | "file_write" => input["path"].as_str().unwrap_or("?").to_string(),
-                    "shell" => format!(
-                        "[{}] {}",
-                        input["interpreter"].as_str().unwrap_or("powershell"),
-                        input["command"]
-                            .as_str()
-                            .unwrap_or("?")
-                            .chars()
-                            .take(100)
-                            .collect::<String>()
-                    ),
-                    "powershell_query" => format!(
-                        "query={} arch={}",
-                        input["query"].as_str().unwrap_or("?"),
-                        input["arch"].as_str().unwrap_or("x64")
-                    ),
-                    "web_search" => input["query"]
-                        .as_str()
-                        .unwrap_or("?")
-                        .chars()
-                        .take(80)
-                        .collect(),
-                    "browser" => format!(
-                        "action={} url={}",
-                        input["action"].as_str().unwrap_or("?"),
-                        input["url"].as_str().unwrap_or("")
-                    ),
-                    "com_invoke" => format!(
-                        "action={} prog_id={} arch={}",
-                        input["action"].as_str().unwrap_or("?"),
-                        input["prog_id"].as_str().unwrap_or("?"),
-                        input["arch"].as_str().unwrap_or("x64")
-                    ),
-                    "wmi" => format!(
-                        "preset={} query={}",
-                        input["preset"].as_str().unwrap_or(""),
-                        input["query"]
+                Some(tool) => {
+                    // Log key input fields to aid debugging (path, command, query, etc.)
+                    let input_hint = match name {
+                        "file_read" | "file_write" => {
+                            input["path"].as_str().unwrap_or("?").to_string()
+                        }
+                        "shell" => format!(
+                            "[{}] {}",
+                            input["interpreter"].as_str().unwrap_or("powershell"),
+                            input["command"]
+                                .as_str()
+                                .unwrap_or("?")
+                                .chars()
+                                .take(100)
+                                .collect::<String>()
+                        ),
+                        "powershell_query" => format!(
+                            "query={} arch={}",
+                            input["query"].as_str().unwrap_or("?"),
+                            input["arch"].as_str().unwrap_or("x64")
+                        ),
+                        "web_search" => input["query"]
                             .as_str()
                             .unwrap_or("?")
                             .chars()
                             .take(80)
-                            .collect::<String>()
-                    ),
-                    "uia" => format!(
-                        "action={} name={} window={}",
-                        input["action"].as_str().unwrap_or("?"),
-                        input["name"].as_str().unwrap_or(""),
-                        input["window_title"].as_str().unwrap_or("")
-                    ),
-                    _ => input.to_string().chars().take(100).collect(),
-                };
-                // Check cancel before starting the tool
-                if cancel.load(Ordering::Relaxed) {
-                    let _ = event_tx
-                        .send(AgentEvent::ToolEnd {
-                            id: id.to_string(),
-                            name: name.to_string(),
-                            result: "已取消".into(),
+                            .collect(),
+                        "browser" => format!(
+                            "action={} url={}",
+                            input["action"].as_str().unwrap_or("?"),
+                            input["url"].as_str().unwrap_or("")
+                        ),
+                        "com_invoke" => format!(
+                            "action={} prog_id={} arch={}",
+                            input["action"].as_str().unwrap_or("?"),
+                            input["prog_id"].as_str().unwrap_or("?"),
+                            input["arch"].as_str().unwrap_or("x64")
+                        ),
+                        "wmi" => format!(
+                            "preset={} query={}",
+                            input["preset"].as_str().unwrap_or(""),
+                            input["query"]
+                                .as_str()
+                                .unwrap_or("?")
+                                .chars()
+                                .take(80)
+                                .collect::<String>()
+                        ),
+                        "uia" => format!(
+                            "action={} name={} window={}",
+                            input["action"].as_str().unwrap_or("?"),
+                            input["name"].as_str().unwrap_or(""),
+                            input["window_title"].as_str().unwrap_or("")
+                        ),
+                        _ => input.to_string().chars().take(100).collect(),
+                    };
+                    // Check cancel before starting the tool
+                    if cancel.load(Ordering::Relaxed) {
+                        let _ = event_tx
+                            .send(AgentEvent::ToolEnd {
+                                id: id.to_string(),
+                                name: name.to_string(),
+                                result: "已取消".into(),
+                                is_error: true,
+                            })
+                            .await;
+                        blocks.push(ContentBlock::ToolResult {
+                            tool_use_id: id.to_string(),
+                            content: "已取消".into(),
                             is_error: true,
-                        })
-                        .await;
-                    blocks.push(ContentBlock::ToolResult {
-                        tool_use_id: id.to_string(),
-                        content: "已取消".into(),
-                        is_error: true,
-                    });
-                    return blocks;
-                }
+                        });
+                        return blocks;
+                    }
 
-                debug!("Executing tool: {} | input: {}", name, input_hint);
-                let mut tool_ctx = ctx.clone();
-                tool_ctx.tool_use_id = Some(id.to_string());
-                let cancel_clone = Arc::clone(cancel);
-                // Poll cancel flag every 200 ms while the tool runs
-                let cancel_watcher = async move {
-                    loop {
-                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                        if cancel_clone.load(Ordering::Relaxed) {
-                            break;
-                        }
-                    }
-                };
-                tokio::select! {
-                    biased;
-                    res = tokio::time::timeout(
-                        std::time::Duration::from_secs(TOOL_TIMEOUT_SECS),
-                        tool.call(input.clone(), &tool_ctx),
-                    ) => {
-                        match res {
-                            Ok(Ok(r)) => r,
-                            Ok(Err(e)) => {
-                                let err_msg = e.to_string();
-                                warn!("Tool '{}' error: {} | input: {}", name, err_msg, input_hint);
-                                schema_correction_envelope = maybe_schema_correction_envelope(
-                                    &self.registry,
-                                    name,
-                                    &err_msg,
-                                );
-                                let friendly = friendly_tool_error(name, &err_msg);
-                                super::tool::ToolResult::err(friendly)
-                            }
-                            Err(_) => {
-                                warn!("Tool '{}' timed out after {}s", name, TOOL_TIMEOUT_SECS);
-                                super::tool::ToolResult::err(format!(
-                                    "工具 '{}' 执行超时（{}秒）。可能原因：命令阻塞、网络超时或进程挂起。请尝试简化命令或分步执行。",
-                                    name, TOOL_TIMEOUT_SECS
-                                ))
+                    debug!("Executing tool: {} | input: {}", name, input_hint);
+                    let mut tool_ctx = ctx.clone();
+                    tool_ctx.tool_use_id = Some(id.to_string());
+                    let cancel_clone = Arc::clone(cancel);
+                    // Poll cancel flag every 200 ms while the tool runs
+                    let cancel_watcher = async move {
+                        loop {
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                            if cancel_clone.load(Ordering::Relaxed) {
+                                break;
                             }
                         }
-                    }
-                    _ = cancel_watcher => {
-                        warn!("Tool '{}' interrupted by user cancel", name);
-                        super::tool::ToolResult::err("已被用户取消".to_string())
+                    };
+                    tokio::select! {
+                        biased;
+                        res = tokio::time::timeout(
+                            std::time::Duration::from_secs(TOOL_TIMEOUT_SECS),
+                            tool.call(input.clone(), &tool_ctx),
+                        ) => {
+                            match res {
+                                Ok(Ok(r)) => r,
+                                Ok(Err(e)) => {
+                                    let err_msg = e.to_string();
+                                    warn!("Tool '{}' error: {} | input: {}", name, err_msg, input_hint);
+                                    schema_correction_envelope = maybe_schema_correction_envelope(
+                                        &self.registry,
+                                        name,
+                                        &err_msg,
+                                    );
+                                    let friendly = friendly_tool_error(name, &err_msg);
+                                    super::tool::ToolResult::err(friendly)
+                                }
+                                Err(_) => {
+                                    warn!("Tool '{}' timed out after {}s", name, TOOL_TIMEOUT_SECS);
+                                    super::tool::ToolResult::err(format!(
+                                        "工具 '{}' 执行超时（{}秒）。可能原因：命令阻塞、网络超时或进程挂起。请尝试简化命令或分步执行。",
+                                        name, TOOL_TIMEOUT_SECS
+                                    ))
+                                }
+                            }
+                        }
+                        _ = cancel_watcher => {
+                            warn!("Tool '{}' interrupted by user cancel", name);
+                            super::tool::ToolResult::err("已被用户取消".to_string())
+                        }
                     }
                 }
-            }
-            None => {
-                warn!("Tool '{}' not found in registry", name);
-                let available: Vec<String> = self
-                    .registry
-                    .all()
-                    .iter()
-                    .map(|t| t.name().to_string())
-                    .collect();
-                super::tool::ToolResult::err(format!(
-                    "Tool '{}' does not exist. Available tools: {}.",
-                    name,
-                    available.join(", ")
-                ))
-            }
+                None => {
+                    warn!("Tool '{}' not found in registry", name);
+                    let available: Vec<String> = self
+                        .registry
+                        .all()
+                        .iter()
+                        .map(|t| t.name().to_string())
+                        .collect();
+                    super::tool::ToolResult::err(format!(
+                        "Tool '{}' does not exist. Available tools: {}.",
+                        name,
+                        available.join(", ")
+                    ))
+                }
             }
         };
 
@@ -2858,14 +2863,16 @@ impl AgentLoop {
                                         })
                                         .await;
                                     if outcome.changed {
-                                        total_input =
-                                            total_input.saturating_add(outcome.summary_input_tokens);
+                                        total_input = total_input
+                                            .saturating_add(outcome.summary_input_tokens);
                                         total_output = total_output
                                             .saturating_add(outcome.summary_output_tokens);
                                         cumulative_input_tokens = cumulative_input_tokens
-                                            .saturating_add(i64::from(outcome.summary_input_tokens));
-                                        cumulative_output_tokens =
-                                            cumulative_output_tokens.saturating_add(i64::from(
+                                            .saturating_add(i64::from(
+                                                outcome.summary_input_tokens,
+                                            ));
+                                        cumulative_output_tokens = cumulative_output_tokens
+                                            .saturating_add(i64::from(
                                                 outcome.summary_output_tokens,
                                             ));
                                         next_auto_compact_threshold =

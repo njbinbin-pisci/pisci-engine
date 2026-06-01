@@ -206,8 +206,7 @@ pub struct HarnessConfig {
     pub hooks: Option<Arc<dyn crate::agent::hooks::AgentHooks>>,
     /// Optional pluggable compaction policy. `None` uses the kernel's built-in
     /// [`crate::agent::loop_::DefaultCompaction`].
-    pub compaction_strategy:
-        Option<Arc<dyn crate::agent::compaction_strategy::CompactionStrategy>>,
+    pub compaction_strategy: Option<Arc<dyn crate::agent::compaction_strategy::CompactionStrategy>>,
 }
 
 impl HarnessConfig {

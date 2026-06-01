@@ -251,8 +251,7 @@ impl FileJournal {
                     if let Some(parent) = abs.parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
-                    std::fs::write(&abs, bytes)
-                        .with_context(|| format!("restore {rel} failed"))?;
+                    std::fs::write(&abs, bytes).with_context(|| format!("restore {rel} failed"))?;
                 }
             } else {
                 // File was created by the agent — remove it to undo.

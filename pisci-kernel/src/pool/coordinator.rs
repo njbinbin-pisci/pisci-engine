@@ -459,10 +459,7 @@ fn is_todo_board_reconciled(status: &str) -> bool {
     matches!(status, "done" | "blocked" | "cancelled" | "needs_review")
 }
 
-async fn refresh_todo(
-    store: &PoolStore,
-    todo_id: &str,
-) -> anyhow::Result<Option<KoiTodo>> {
+async fn refresh_todo(store: &PoolStore, todo_id: &str) -> anyhow::Result<Option<KoiTodo>> {
     let lookup = todo_id.to_string();
     store.read(move |db| db.get_koi_todo(&lookup)).await
 }
