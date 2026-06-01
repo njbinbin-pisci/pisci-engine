@@ -201,6 +201,13 @@ pub struct HarnessConfig {
     /// Optional override model used to produce rolling summaries (p7).
     /// `None` means "reuse the main model".
     pub summary_model: Option<String>,
+    /// Optional host lifecycle hooks (tool before/after, context events).
+    /// Wired by hosts that observe the loop (e.g. CodeZ's file journal).
+    pub hooks: Option<Arc<dyn crate::agent::hooks::AgentHooks>>,
+    /// Optional pluggable compaction policy. `None` uses the kernel's built-in
+    /// [`crate::agent::loop_::DefaultCompaction`].
+    pub compaction_strategy:
+        Option<Arc<dyn crate::agent::compaction_strategy::CompactionStrategy>>,
 }
 
 impl HarnessConfig {
@@ -418,6 +425,23 @@ impl HarnessConfig {
         self
     }
 
+    /// Post-construction setter for host lifecycle hooks. Lets scene factories
+    /// (`for_scheduler`, …) keep fixed argument lists while hosts attach hooks
+    /// before `into_agent_loop`.
+    pub fn with_hooks(mut self, hooks: Arc<dyn crate::agent::hooks::AgentHooks>) -> Self {
+        self.hooks = Some(hooks);
+        self
+    }
+
+    /// Post-construction setter for the compaction policy (see `with_hooks`).
+    pub fn with_compaction_strategy(
+        mut self,
+        strategy: Arc<dyn crate::agent::compaction_strategy::CompactionStrategy>,
+    ) -> Self {
+        self.compaction_strategy = Some(strategy);
+        self
+    }
+
     /// Bridge: turn a harness config into the legacy
     /// [`crate::agent::loop_::AgentLoop`] value that existing call sites
     /// consume. p1 uses this during the incremental migration; later
@@ -452,6 +476,10 @@ impl HarnessConfig {
             notification_rx: notification_rx.map(tokio::sync::Mutex::new),
             auto_compact_input_tokens_threshold: self.auto_compact_input_tokens_threshold,
             enable_streaming: self.enable_streaming,
+            hooks: self.hooks,
+            compaction_strategy: self
+                .compaction_strategy
+                .unwrap_or_else(|| Arc::new(crate::agent::loop_::DefaultCompaction)),
         }
     }
 }
@@ -492,8 +520,25 @@ impl HarnessConfigBuilder {
             frame_provider: None,
             plan_state: None,
             summary_model: None,
+            hooks: None,
+            compaction_strategy: None,
         };
         Self { inner }
+    }
+
+    /// Wire host lifecycle hooks into the loop.
+    pub fn with_hooks(mut self, hooks: Arc<dyn crate::agent::hooks::AgentHooks>) -> Self {
+        self.inner.hooks = Some(hooks);
+        self
+    }
+
+    /// Override the proactive compaction policy.
+    pub fn with_compaction_strategy(
+        mut self,
+        strategy: Arc<dyn crate::agent::compaction_strategy::CompactionStrategy>,
+    ) -> Self {
+        self.inner.compaction_strategy = Some(strategy);
+        self
     }
 
     pub fn with_fallback_models(mut self, models: Vec<String>) -> Self {

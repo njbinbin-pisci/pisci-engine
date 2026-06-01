@@ -6,6 +6,9 @@
 /// - Tool result size guard (dynamic, based on context window)
 /// - In-memory message compaction for long-running tasks
 /// - Checkpoint size guard for DB persistence
+use super::compaction_strategy::{
+    CompactionRequest, CompactionResult, CompactionStrategy, CompactionTrigger,
+};
 use super::messages::AgentEvent;
 use super::tool::{ToolContext, ToolRegistry};
 use super::vision;
@@ -740,6 +743,198 @@ pub struct CompactionOutcome {
     /// open items / evidence / errors learned). `None` when the legacy
     /// prose-summary path was used and no structure was recovered.
     pub structured_rolling: Option<crate::agent::summary_worker::StructuredRollingSummary>,
+}
+
+/// The kernel's built-in proactive compaction policy.
+///
+/// Reproduces the previously-inline behavior: build a demoted request view,
+/// estimate tokens, and run up to two Level-2 (rolling-summary) passes —
+/// keeping the newest 60% then 30% of the message budget — until the estimate
+/// drops under the 60% safety line. Lives in this module so it can reach the
+/// private structured fields of [`CompactionOutcome`] and the in-module
+/// helpers / constants.
+#[derive(Default)]
+pub struct DefaultCompaction;
+
+#[async_trait::async_trait]
+impl CompactionStrategy for DefaultCompaction {
+    async fn compact(&self, req: CompactionRequest<'_>) -> CompactionResult {
+        match req.trigger {
+            CompactionTrigger::Proactive => self.compact_proactive(req).await,
+            CompactionTrigger::Overflow => self.compact_overflow(req).await,
+        }
+    }
+}
+
+impl DefaultCompaction {
+    /// Pre-call, estimate-driven 2-pass summarisation (keep 60% → 30%).
+    async fn compact_proactive(&self, req: CompactionRequest<'_>) -> CompactionResult {
+        let total_budget =
+            crate::llm::compute_total_input_budget(req.context_window, req.max_tokens);
+        let static_overhead_tokens =
+            crate::llm::estimate_request_overhead_tokens(Some(req.system_prompt), req.tool_defs);
+        let message_budget = total_budget.saturating_sub(static_overhead_tokens);
+        let single_limit =
+            (message_budget as f64 * CONTEXT_SINGLE_RESULT_SHARE * 4.0) as usize;
+
+        let mut messages = req.messages;
+        let mut rolling_summary = req.rolling_summary.to_string();
+        let mut cumulative_input_tokens = req.cumulative_input_tokens;
+        let mut next_auto_compact_threshold = req.next_auto_compact_threshold;
+        let mut summary_input_tokens = 0u32;
+        let mut summary_output_tokens = 0u32;
+        let mut changed = false;
+        let mut structured_plan_items: Vec<String> = Vec::new();
+        let mut structured_next_step_hint: Option<String> = None;
+
+        // Build the demoted request view (minimal receipts for older turns)
+        // purely to estimate whether we're over budget.
+        let mut demoted = build_request_messages(
+            &messages,
+            req.tool_minimals,
+            CTX_PRESERVE_RECENT_TURNS,
+            CTX_KEEP_RECENT_TOOL_CARRIERS,
+        );
+        compact_trim_tool_results(&mut demoted, single_limit);
+        let req_messages = vision::inject_selected_context(&demoted, req.session_id).await;
+        let mut estimated = crate::llm::estimate_request_input_tokens(
+            &req_messages,
+            Some(req.system_prompt),
+            req.tool_defs,
+        );
+        info!(
+            "context check: {} messages, ~{} estimated request tokens (total_budget={}, message_budget={}, threshold={})",
+            messages.len(), estimated, total_budget, message_budget,
+            (total_budget as f64 * 0.60) as usize,
+        );
+
+        // Up to 2 passes: first keep newest 60% of budget, then 30%.
+        let keep_ratios: &[f64] = &[SUMMARY_KEEP_RECENT_RATIO, SUMMARY_KEEP_RECENT_RATIO * 0.5];
+        let min_threshold_estimate = (total_budget as f64 * 0.35) as usize;
+        for (pass, &ratio) in keep_ratios.iter().enumerate() {
+            let threshold_reached = req.threshold_step > 0
+                && cumulative_input_tokens >= next_auto_compact_threshold
+                && estimated >= min_threshold_estimate;
+            // Once the per-request estimate is below the 60% safety line, stop.
+            if estimated <= (total_budget as f64 * 0.60) as usize {
+                break;
+            }
+            let keep_tokens = (message_budget as f64 * ratio) as usize;
+            warn!(
+                "proactive compaction pass={} estimated_tokens={} total_budget={} message_budget={} keep_tokens={} cumulative_input_tokens={} threshold_reached={} min_threshold_estimate={}",
+                pass + 1, estimated, total_budget, message_budget, keep_tokens, cumulative_input_tokens, threshold_reached, min_threshold_estimate
+            );
+            if let Some(compacted) = compact_summarise(
+                messages.clone(),
+                keep_tokens,
+                req.client,
+                req.model,
+                req.max_tokens,
+                (!rolling_summary.trim().is_empty()).then_some(rolling_summary.as_str()),
+            )
+            .await
+            {
+                summary_input_tokens = summary_input_tokens.saturating_add(compacted.input_tokens);
+                summary_output_tokens =
+                    summary_output_tokens.saturating_add(compacted.output_tokens);
+                cumulative_input_tokens =
+                    cumulative_input_tokens.saturating_add(i64::from(compacted.input_tokens));
+                let compacted_demoted = build_request_messages(
+                    &compacted.messages,
+                    req.tool_minimals,
+                    CTX_PRESERVE_RECENT_TURNS,
+                    CTX_KEEP_RECENT_TOOL_CARRIERS,
+                );
+                let compacted_req_messages =
+                    vision::inject_selected_context(&compacted_demoted, req.session_id).await;
+                let new_estimated = crate::llm::estimate_request_input_tokens(
+                    &compacted_req_messages,
+                    Some(req.system_prompt),
+                    req.tool_defs,
+                );
+                info!(
+                    "proactive summarisation pass={} complete: {} → {} messages, tokens {} → {}",
+                    pass + 1, messages.len(), compacted.messages.len(), estimated, new_estimated,
+                );
+                rolling_summary = compacted.summary;
+                messages = compacted.messages;
+                estimated = new_estimated;
+                structured_plan_items = compacted.structured_plan_items.clone();
+                structured_next_step_hint = compacted.structured_next_step_hint.clone();
+                changed = true;
+                if threshold_reached {
+                    let step = req.threshold_step.max(1);
+                    let from_old = next_auto_compact_threshold.saturating_add(step);
+                    let from_now = cumulative_input_tokens.saturating_add(step);
+                    next_auto_compact_threshold = from_old.max(from_now);
+                }
+            } else {
+                warn!(
+                    "proactive summarisation pass={} failed, proceeding with current context",
+                    pass + 1
+                );
+                break;
+            }
+        }
+
+        CompactionResult {
+            changed,
+            messages,
+            rolling_summary,
+            summary_input_tokens,
+            summary_output_tokens,
+            next_auto_compact_threshold,
+            structured_plan_items,
+            structured_next_step_hint,
+        }
+    }
+
+    /// Forced single-pass recovery after the provider rejected an oversized
+    /// request. Unlike the proactive path this never gates on the local
+    /// estimate (which under-counts — that's why the provider overflowed); it
+    /// always summarises, keeping the newest 60% of the message budget. The
+    /// cumulative-token threshold is left untouched (this is error recovery,
+    /// not threshold-driven compaction). `changed = false` ⇒ unrecoverable.
+    async fn compact_overflow(&self, req: CompactionRequest<'_>) -> CompactionResult {
+        let total_budget =
+            crate::llm::compute_total_input_budget(req.context_window, req.max_tokens);
+        let static_overhead_tokens =
+            crate::llm::estimate_request_overhead_tokens(Some(req.system_prompt), req.tool_defs);
+        let message_budget = total_budget.saturating_sub(static_overhead_tokens);
+        let keep_tokens = (message_budget as f64 * SUMMARY_KEEP_RECENT_RATIO) as usize;
+        warn!(
+            "context overflow — attempting LLM summarisation (keep_tokens={})",
+            keep_tokens
+        );
+        match compact_summarise(
+            req.messages.clone(),
+            keep_tokens,
+            req.client,
+            req.model,
+            req.max_tokens,
+            (!req.rolling_summary.trim().is_empty()).then_some(req.rolling_summary),
+        )
+        .await
+        {
+            Some(c) => CompactionResult {
+                changed: true,
+                messages: c.messages,
+                rolling_summary: c.summary,
+                summary_input_tokens: c.input_tokens,
+                summary_output_tokens: c.output_tokens,
+                next_auto_compact_threshold: req.next_auto_compact_threshold,
+                structured_plan_items: c.structured_plan_items.clone(),
+                structured_next_step_hint: c.structured_next_step_hint.clone(),
+            },
+            None => CompactionResult {
+                changed: false,
+                messages: req.messages,
+                rolling_summary: req.rolling_summary.to_string(),
+                next_auto_compact_threshold: req.next_auto_compact_threshold,
+                ..Default::default()
+            },
+        }
+    }
 }
 
 /// Serialize a batch of `ContentBlock::ToolResult` blocks into the DB's
@@ -1495,6 +1690,12 @@ pub struct AgentLoop {
     /// through `LlmClient::complete` and the full text is emitted once per
     /// turn.
     pub enable_streaming: bool,
+    /// Optional host lifecycle hooks (tool before/after, context events).
+    /// `None` for hosts that don't observe the loop (CLI, fish, tests).
+    pub hooks: Option<Arc<dyn crate::agent::hooks::AgentHooks>>,
+    /// Proactive context-compaction policy. Hosts may swap this; defaults to
+    /// [`DefaultCompaction`] which reproduces the built-in behavior.
+    pub compaction_strategy: Arc<dyn CompactionStrategy>,
 }
 
 impl AgentLoop {
@@ -1641,8 +1842,30 @@ impl AgentLoop {
             })
             .await;
 
+        // Lifecycle hook: before_tool. Lets a host capture pre-state (e.g.
+        // snapshot a file before it is overwritten) or deny the call.
+        let hook_event = crate::agent::hooks::ToolHookEvent {
+            session_id: &ctx.session_id,
+            tool_use_id: id,
+            tool_name: name,
+            input,
+            workspace_root: &ctx.workspace_root,
+        };
+        let deny_reason = if let Some(hooks) = &self.hooks {
+            match hooks.before_tool(&hook_event).await {
+                crate::agent::hooks::HookDecision::Deny(r) => Some(r),
+                crate::agent::hooks::HookDecision::Continue => None,
+            }
+        } else {
+            None
+        };
+
         let mut schema_correction_envelope: Option<String> = None;
-        let result = match self.registry.get(name) {
+        let result = if let Some(reason) = deny_reason {
+            warn!("Tool '{}' denied by host hook: {}", name, reason);
+            super::tool::ToolResult::err(reason)
+        } else {
+            match self.registry.get(name) {
             Some(tool) => {
                 // Log key input fields to aid debugging (path, command, query, etc.)
                 let input_hint = match name {
@@ -1776,7 +1999,14 @@ impl AgentLoop {
                     available.join(", ")
                 ))
             }
+            }
         };
+
+        // Lifecycle hook: after_tool. Observe the result (journaling,
+        // telemetry, post-edit checks). Runs before the result is emitted.
+        if let Some(hooks) = &self.hooks {
+            hooks.after_tool(&hook_event, &result).await;
+        }
 
         let mut final_result_content =
             decorate_tool_failure_for_agent(name, input, &result.content, result.is_error);
@@ -2288,9 +2518,10 @@ impl AgentLoop {
                 }
             }
 
-            // Dynamic compaction (Level-1): trim oversized individual tool results.
-            // single_limit is in chars (not tokens): budget tokens × share × ~4 chars/token.
-            // Bug fix: previously multiplied by 4 again, making the limit 4× too large.
+            // Proactive context compaction, delegated to the configured
+            // strategy (default reproduces the built-in Level-2 behavior).
+            // The loop retains orchestration: token accounting, DB persistence
+            // of the rolling summary / state frame, and the UI usage event.
             {
                 let total_budget =
                     crate::llm::compute_total_input_budget(self.context_window, self.max_tokens);
@@ -2299,14 +2530,74 @@ impl AgentLoop {
                     &tool_defs,
                 );
                 let message_budget = total_budget.saturating_sub(static_overhead_tokens);
-                // single_limit in chars: message_budget_tokens × share × 4 chars/token
                 let single_limit =
                     (message_budget as f64 * CONTEXT_SINGLE_RESULT_SHARE * 4.0) as usize;
 
-                // Build the request-view first. For the middle tier, tool-result
-                // blocks are swapped to rule-based minimal receipts; this is
-                // expected to bring most sessions well under the budget, after
-                // which the legacy char-trim is only a safety net.
+                let outcome = self
+                    .compaction_strategy
+                    .compact(CompactionRequest {
+                        trigger: CompactionTrigger::Proactive,
+                        messages: messages.clone(),
+                        rolling_summary: &rolling_summary,
+                        system_prompt: &self.system_prompt,
+                        model: &self.model,
+                        max_tokens: self.max_tokens,
+                        context_window: self.context_window,
+                        tool_defs: &tool_defs,
+                        tool_minimals: &tool_minimals,
+                        session_id: &ctx.session_id,
+                        cumulative_input_tokens,
+                        next_auto_compact_threshold,
+                        threshold_step,
+                        client: self.client.as_ref(),
+                    })
+                    .await;
+
+                if outcome.changed {
+                    // Account for summariser billing.
+                    total_input = total_input.saturating_add(outcome.summary_input_tokens);
+                    total_output = total_output.saturating_add(outcome.summary_output_tokens);
+                    cumulative_input_tokens = cumulative_input_tokens
+                        .saturating_add(i64::from(outcome.summary_input_tokens));
+                    cumulative_output_tokens = cumulative_output_tokens
+                        .saturating_add(i64::from(outcome.summary_output_tokens));
+                    next_auto_compact_threshold = outcome.next_auto_compact_threshold;
+                    rolling_summary = outcome.rolling_summary;
+                    rolling_summary_version += 1;
+                    messages = outcome.messages;
+
+                    if let Some(ref db_arc) = self.db {
+                        let db = db_arc.lock().await;
+                        if let Err(error) = db.update_session_rolling_summary(
+                            &ctx.session_id,
+                            &rolling_summary,
+                            rolling_summary_version,
+                        ) {
+                            warn!("Failed to persist rolling summary: {}", error);
+                        }
+                        // p6 + p7: refresh the state frame so a resume right
+                        // after compaction picks up the latest bearings. Merge
+                        // in the structured plan / next-step hint when present.
+                        let mut frame =
+                            crate::agent::state_frame::derive_frame_from_tail(&messages, 24);
+                        if !outcome.structured_plan_items.is_empty() {
+                            frame.active_plan_items = outcome.structured_plan_items.clone();
+                        }
+                        if outcome.structured_next_step_hint.is_some() {
+                            frame.next_step_hint = outcome.structured_next_step_hint.clone();
+                        }
+                        let frame_json = frame.to_json();
+                        if let Err(error) = db
+                            .update_session_state_frame_json(&ctx.session_id, frame_json.as_deref())
+                        {
+                            warn!("Failed to persist state frame: {}", error);
+                        }
+                    }
+                }
+
+                // Build the (post-compaction) request view + estimate purely
+                // for the UI usage event, so the ring reflects what we're about
+                // to send. This mirrors the view the LLM-call path rebuilds.
                 let mut demoted = build_request_messages(
                     &messages,
                     &tool_minimals,
@@ -2314,160 +2605,16 @@ impl AgentLoop {
                     CTX_KEEP_RECENT_TOOL_CARRIERS,
                 );
                 compact_trim_tool_results(&mut demoted, single_limit);
-
-                // Dynamic compaction (Level-2 proactive): if estimated token count exceeds
-                // 80% of the budget, summarise old messages now — before the LLM call —
-                // rather than waiting for a context overflow error (which some models never
-                // emit, instead silently truncating or producing near-empty responses).
-                //
-                // We retry with a smaller keep_tokens if the first pass still leaves
-                // too many tokens (can happen when the budget estimate is conservative).
-                let req_messages = vision::inject_selected_context(&demoted, &ctx.session_id).await;
-                let mut estimated = crate::llm::estimate_request_input_tokens(
-                    &req_messages,
+                let req_view = vision::inject_selected_context(&demoted, &ctx.session_id).await;
+                let estimated = crate::llm::estimate_request_input_tokens(
+                    &req_view,
                     Some(&self.system_prompt),
                     &tool_defs,
                 );
-                info!(
-                    "context check: {} messages, ~{} estimated request tokens (total_budget={}, message_budget={}, threshold={})",
-                    messages.len(),
-                    estimated,
-                    total_budget,
-                    message_budget,
-                    (total_budget as f64 * 0.60) as usize,
-                );
-                // Up to 2 compaction passes: first at 60% keep, then at 30% keep
-                let keep_ratios: &[f64] =
-                    &[SUMMARY_KEEP_RECENT_RATIO, SUMMARY_KEEP_RECENT_RATIO * 0.5];
-                let min_threshold_estimate = (total_budget as f64 * 0.35) as usize;
-                for (pass, &ratio) in keep_ratios.iter().enumerate() {
-                    let threshold_reached = threshold_step > 0
-                        && cumulative_input_tokens >= next_auto_compact_threshold
-                        && estimated >= min_threshold_estimate;
-                    // Bug fix 🔴1: once the per-request estimate is below the
-                    // 60% safety line, stop — regardless of whether cumulative
-                    // threshold_reached is still true. Otherwise a session
-                    // repeatedly pays for Level-2 summarisation every iteration
-                    // even though nothing is actually over budget.
-                    if estimated <= (total_budget as f64 * 0.60) as usize {
-                        break;
-                    }
-                    let keep_tokens = (message_budget as f64 * ratio) as usize;
-                    warn!(
-                        "proactive compaction pass={} estimated_tokens={} total_budget={} message_budget={} keep_tokens={} cumulative_input_tokens={} threshold_reached={} min_threshold_estimate={}",
-                        pass + 1, estimated, total_budget, message_budget, keep_tokens, cumulative_input_tokens, threshold_reached, min_threshold_estimate
-                    );
-                    // Level-2 summarisation receives the FULL in-memory messages
-                    // (never the demoted/minimal view) so the summariser has
-                    // enough signal to produce a faithful rolling summary.
-                    if let Some(compacted) = compact_summarise(
-                        messages.clone(),
-                        keep_tokens,
-                        self.client.as_ref(),
-                        &self.model,
-                        self.max_tokens,
-                        (!rolling_summary.trim().is_empty()).then_some(rolling_summary.as_str()),
-                    )
-                    .await
-                    {
-                        // Account for prompt/completion tokens billed to the summariser.
-                        total_input = total_input.saturating_add(compacted.input_tokens);
-                        total_output = total_output.saturating_add(compacted.output_tokens);
-                        cumulative_input_tokens = cumulative_input_tokens
-                            .saturating_add(i64::from(compacted.input_tokens));
-                        cumulative_output_tokens = cumulative_output_tokens
-                            .saturating_add(i64::from(compacted.output_tokens));
-                        let compacted_demoted = build_request_messages(
-                            &compacted.messages,
-                            &tool_minimals,
-                            CTX_PRESERVE_RECENT_TURNS,
-                            CTX_KEEP_RECENT_TOOL_CARRIERS,
-                        );
-                        let compacted_req_messages =
-                            vision::inject_selected_context(&compacted_demoted, &ctx.session_id)
-                                .await;
-                        let new_estimated = crate::llm::estimate_request_input_tokens(
-                            &compacted_req_messages,
-                            Some(&self.system_prompt),
-                            &tool_defs,
-                        );
-                        info!(
-                            "proactive summarisation pass={} complete: {} → {} messages, tokens {} → {}",
-                            pass + 1,
-                            messages.len(),
-                            compacted.messages.len(),
-                            estimated,
-                            new_estimated,
-                        );
-                        rolling_summary = compacted.summary;
-                        rolling_summary_version += 1;
-                        messages = compacted.messages;
-                        estimated = new_estimated;
-                        // p7: structured fields from summariser output; forwarded
-                        // to the state_frame persist block a few lines below.
-                        let structured_plan_items_latest: Vec<String> =
-                            compacted.structured_plan_items.clone();
-                        let structured_next_step_hint_latest: Option<String> =
-                            compacted.structured_next_step_hint.clone();
-                        if threshold_reached {
-                            // Bug fix 🔴2: bump relative to the CURRENT cumulative
-                            // so that one oversized response cannot push cumulative
-                            // far past the new threshold and cause the next
-                            // iteration to re-trigger immediately.
-                            let step = threshold_step.max(1);
-                            let from_old = next_auto_compact_threshold.saturating_add(step);
-                            let from_now = cumulative_input_tokens.saturating_add(step);
-                            next_auto_compact_threshold = from_old.max(from_now);
-                        }
-                        if let Some(ref db_arc) = self.db {
-                            let db = db_arc.lock().await;
-                            if let Err(error) = db.update_session_rolling_summary(
-                                &ctx.session_id,
-                                &rolling_summary,
-                                rolling_summary_version,
-                            ) {
-                                warn!("Failed to persist rolling summary: {}", error);
-                            }
-                            // p6 + p7: refresh the state frame snapshot so a
-                            // resume right after this compaction picks up the
-                            // most recent tool call / error signals. Merge in
-                            // the structured active_plan_items / next_step_hint
-                            // if the summariser returned them.
-                            let mut frame =
-                                crate::agent::state_frame::derive_frame_from_tail(&messages, 24);
-                            if !structured_plan_items_latest.is_empty() {
-                                frame.active_plan_items = structured_plan_items_latest.clone();
-                            }
-                            if structured_next_step_hint_latest.is_some() {
-                                frame.next_step_hint = structured_next_step_hint_latest.clone();
-                            }
-                            let frame_json = frame.to_json();
-                            if let Err(error) = db.update_session_state_frame_json(
-                                &ctx.session_id,
-                                frame_json.as_deref(),
-                            ) {
-                                warn!("Failed to persist state frame: {}", error);
-                            }
-                        }
-                    } else {
-                        // Summarisation failed — stop trying
-                        warn!("proactive summarisation pass={} failed, proceeding with current context", pass + 1);
-                        break;
-                    }
-                }
-
-                // Emit a context-usage snapshot for the UI ring indicator. This fires on
-                // every iteration regardless of whether compaction ran, so the ring
-                // reflects the true state of the request we're about to send.
                 let trigger_threshold = (total_budget as f64 * 0.60) as usize;
 
-                // p8 — compute a best-effort per-layer breakdown so the
-                // ring indicator can show which slot (system / tools /
-                // history / tool-results / vision) is dominating context.
-                // This uses the already-built demoted + vision-injected
-                // request view so it matches the numbers sent to the LLM.
+                // p8 — best-effort per-layer breakdown for the ring indicator.
                 let breakdown_snapshot = {
-                    let req_view = vision::inject_selected_context(&demoted, &ctx.session_id).await;
                     let rolling_tokens = if rolling_summary.trim().is_empty() {
                         0
                     } else {
@@ -2686,42 +2833,46 @@ impl AgentLoop {
 
                                 if is_context_overflow_error(&msg) && !context_overflow_attempted {
                                     context_overflow_attempted = true;
-                                    let total_budget = crate::llm::compute_total_input_budget(
-                                        self.context_window,
-                                        self.max_tokens,
-                                    );
-                                    let static_overhead_tokens =
-                                        crate::llm::estimate_request_overhead_tokens(
-                                            Some(&self.system_prompt),
-                                            &tool_defs,
-                                        );
-                                    let message_budget =
-                                        total_budget.saturating_sub(static_overhead_tokens);
-                                    // keep_tokens: newest 60% of the budget in tokens
-                                    let keep_tokens = (message_budget as f64
-                                        * SUMMARY_KEEP_RECENT_RATIO)
-                                        as usize;
-                                    warn!("context overflow — attempting LLM summarisation (keep_tokens={})", keep_tokens);
-                                    let compacted = compact_summarise(
-                                        messages.clone(),
-                                        keep_tokens,
-                                        self.client.as_ref(),
-                                        model_candidate,
-                                        self.max_tokens,
-                                        (!rolling_summary.trim().is_empty())
-                                            .then_some(rolling_summary.as_str()),
-                                    )
-                                    .await;
-                                    if let Some(c) = compacted {
-                                        total_input = total_input.saturating_add(c.input_tokens);
-                                        total_output = total_output.saturating_add(c.output_tokens);
+                                    // Forced recovery via the same pluggable
+                                    // strategy (Overflow trigger) so a custom
+                                    // host policy is never bypassed. Uses the
+                                    // candidate model — possibly a fallback —
+                                    // as the summariser.
+                                    let outcome = self
+                                        .compaction_strategy
+                                        .compact(CompactionRequest {
+                                            trigger: CompactionTrigger::Overflow,
+                                            messages: messages.clone(),
+                                            rolling_summary: &rolling_summary,
+                                            system_prompt: &self.system_prompt,
+                                            model: model_candidate,
+                                            max_tokens: self.max_tokens,
+                                            context_window: self.context_window,
+                                            tool_defs: &tool_defs,
+                                            tool_minimals: &tool_minimals,
+                                            session_id: &ctx.session_id,
+                                            cumulative_input_tokens,
+                                            next_auto_compact_threshold,
+                                            threshold_step,
+                                            client: self.client.as_ref(),
+                                        })
+                                        .await;
+                                    if outcome.changed {
+                                        total_input =
+                                            total_input.saturating_add(outcome.summary_input_tokens);
+                                        total_output = total_output
+                                            .saturating_add(outcome.summary_output_tokens);
                                         cumulative_input_tokens = cumulative_input_tokens
-                                            .saturating_add(i64::from(c.input_tokens));
-                                        cumulative_output_tokens = cumulative_output_tokens
-                                            .saturating_add(i64::from(c.output_tokens));
-                                        rolling_summary = c.summary;
+                                            .saturating_add(i64::from(outcome.summary_input_tokens));
+                                        cumulative_output_tokens =
+                                            cumulative_output_tokens.saturating_add(i64::from(
+                                                outcome.summary_output_tokens,
+                                            ));
+                                        next_auto_compact_threshold =
+                                            outcome.next_auto_compact_threshold;
+                                        rolling_summary = outcome.rolling_summary;
                                         rolling_summary_version += 1;
-                                        messages = c.messages;
+                                        messages = outcome.messages;
                                         if let Some(ref db_arc) = self.db {
                                             let db = db_arc.lock().await;
                                             if let Err(error) = db.update_session_rolling_summary(
@@ -2740,13 +2891,13 @@ impl AgentLoop {
                                                 crate::agent::state_frame::derive_frame_from_tail(
                                                     &messages, 24,
                                                 );
-                                            if !c.structured_plan_items.is_empty() {
+                                            if !outcome.structured_plan_items.is_empty() {
                                                 frame.active_plan_items =
-                                                    c.structured_plan_items.clone();
+                                                    outcome.structured_plan_items.clone();
                                             }
-                                            if c.structured_next_step_hint.is_some() {
+                                            if outcome.structured_next_step_hint.is_some() {
                                                 frame.next_step_hint =
-                                                    c.structured_next_step_hint.clone();
+                                                    outcome.structured_next_step_hint.clone();
                                             }
                                             let frame_json = frame.to_json();
                                             if let Err(error) = db.update_session_state_frame_json(
@@ -3811,6 +3962,8 @@ mod tests {
             notification_rx: None,
             auto_compact_input_tokens_threshold: 0,
             enable_streaming: true,
+            hooks: None,
+            compaction_strategy: Arc::new(super::DefaultCompaction),
         };
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(16);
         let ctx = ToolContext {
