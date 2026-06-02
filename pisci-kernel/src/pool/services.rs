@@ -916,6 +916,7 @@ pub async fn assign_koi(
         };
         let prio = priority.clone();
         let timeout = args.timeout_secs;
+        let depends_on = args.depends_on.clone();
         store
             .write(move |db| {
                 db.create_koi_todo(
@@ -926,7 +927,7 @@ pub async fn assign_koi(
                     &assigned_by,
                     Some(&pool_id),
                     "koi",
-                    None,
+                    depends_on.as_deref(),
                     timeout,
                 )
             })
@@ -975,6 +976,7 @@ pub async fn assign_koi(
         let cfg = cfg.clone();
         let koi_id_clone = koi_id.clone();
         let todo_id = todo.id.clone();
+        let todo_for_dep = todo.clone();
         let msg_id = msg.id;
         let session_id = format!(
             "koi_task_{}_{}",
@@ -982,6 +984,19 @@ pub async fn assign_koi(
             &todo_id[..8.min(todo_id.len())]
         );
         tokio::spawn(async move {
+            let todos = store
+                .read(|db| db.list_koi_todos(None))
+                .await
+                .unwrap_or_default();
+            if !pisci_core::integration::is_todo_dependency_satisfied(&todo_for_dep, &todos) {
+                tracing::info!(
+                    target: "pool::services",
+                    todo_id = %todo_for_dep.id,
+                    depends_on = ?todo_for_dep.depends_on,
+                    "assign_koi: waiting on depends_on before dispatch"
+                );
+                return;
+            }
             let args = coordinator::ExecuteTodoArgs {
                 koi_id: koi_id_clone.clone(),
                 todo_id,
@@ -1042,6 +1057,7 @@ pub async fn create_todo(
     let owner = caller.memory_owner_id.to_string();
     let pool_id = session.id.clone();
     let timeout_secs = args.timeout_secs;
+    let depends_on = args.depends_on.clone();
 
     let todo = store
         .write(move |db| {
@@ -1053,7 +1069,7 @@ pub async fn create_todo(
                 &owner,
                 Some(&pool_id),
                 "koi",
-                None,
+                depends_on.as_deref(),
                 timeout_secs,
             )
         })
@@ -1701,9 +1717,9 @@ pub async fn replace_todo(
 pub async fn merge_branches(
     store: &PoolStore,
     caller: &CallerContext<'_>,
-    pool_id_hint: &str,
+    args: &super::model::MergeBranchesArgs,
 ) -> anyhow::Result<Value> {
-    let session = resolve_pool(store, caller, pool_id_hint, "merge_branches").await?;
+    let session = resolve_pool(store, caller, &args.pool_id, "merge_branches").await?;
     let project_dir = match session.project_dir.as_deref() {
         Some(d) => d.to_string(),
         None => anyhow::bail!(
@@ -1715,7 +1731,30 @@ pub async fn merge_branches(
         anyhow::bail!("No Git repo found at '{}'", project_dir);
     }
 
-    let results = git::merge_koi_branches(&dir, caller.cancel.clone()).await?;
+    let only_branch = args
+        .branch
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let results = git::merge_koi_branches(&dir, caller.cancel.clone(), only_branch).await?;
+
+    for result in &results {
+        let status = match &result.outcome {
+            MergeOutcome::Merged => pisci_core::integration::INTEGRATION_MERGED,
+            MergeOutcome::Conflict { .. } | MergeOutcome::Error { .. } => {
+                pisci_core::integration::INTEGRATION_CONFLICT
+            }
+        };
+        let pool_id = session.id.clone();
+        let branch = result.branch.clone();
+        let status = status.to_string();
+        let _ = store
+            .write(move |db| {
+                db.set_koi_todo_integration_status_by_branch(&pool_id, &branch, &status)
+            })
+            .await;
+    }
+
     let rendered: Vec<String> = results
         .iter()
         .map(|r| match &r.outcome {

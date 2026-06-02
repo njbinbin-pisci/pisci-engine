@@ -151,6 +151,14 @@ pub async fn execute_todo_turn(
     if let Some(pool) = &pool_session {
         ensure_pool_allows_runtime_work(pool, "run Koi work")?;
     }
+    let todos = store.read(|db| db.list_koi_todos(None)).await?;
+    if !pisci_core::integration::is_todo_dependency_satisfied(&todo, &todos) {
+        anyhow::bail!(
+            "Todo '{}' cannot start yet: depends_on {:?} is not satisfied (upstream must be done and merged when it produced a git branch).",
+            &todo.id[..8.min(todo.id.len())],
+            todo.depends_on
+        );
+    }
     let canonical_pool_id = pool_session.as_ref().map(|p| p.id.clone());
 
     claim_and_announce(
@@ -200,6 +208,14 @@ async fn execute_todo_turn_inner(
 
     let workspace =
         maybe_setup_worktree(store, cfg, canonical_pool_id.as_deref(), &koi, &todo).await;
+
+    if workspace.is_some() {
+        let branch = git::koi_branch_name(&koi.name, &todo.id);
+        let todo_id = todo.id.clone();
+        let _ = store
+            .write(move |db| db.set_koi_todo_git_branch(&todo_id, &branch))
+            .await;
+    }
 
     let task = todo.title.clone();
     let project_dir = pool_session.as_ref().and_then(|p| p.project_dir.as_deref());
@@ -1274,6 +1290,9 @@ pub async fn activate_pending_todos(
 
     let mut activated = 0u32;
     for todo in pending {
+        if !pisci_core::integration::is_todo_dependency_satisfied(todo, &todos) {
+            continue;
+        }
         let owner_id = todo.owner_id.clone();
         let koi_status = store
             .read(move |db| {
@@ -1503,6 +1522,8 @@ mod tests {
             claimed_at: None,
             depends_on: None,
             blocked_reason: None,
+            git_branch: None,
+            integration_status: None,
             result_message_id: None,
             source_type: "koi".into(),
             task_timeout_secs: 0,

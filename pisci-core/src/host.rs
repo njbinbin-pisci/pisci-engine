@@ -376,6 +376,10 @@ pub struct TodoSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub depends_on: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integration_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub blocked_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result_message_id: Option<i64>,
@@ -397,6 +401,8 @@ impl From<&crate::models::KoiTodo> for TodoSnapshot {
             pool_session_id: t.pool_session_id.clone(),
             claimed_by: t.claimed_by.clone(),
             depends_on: t.depends_on.clone(),
+            git_branch: t.git_branch.clone(),
+            integration_status: t.integration_status.clone(),
             blocked_reason: t.blocked_reason.clone(),
             result_message_id: t.result_message_id,
             source_type: t.source_type.clone(),

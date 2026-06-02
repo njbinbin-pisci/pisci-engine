@@ -685,6 +685,8 @@ impl Database {
             "ALTER TABLE koi_todos ADD COLUMN result_message_id INTEGER",
             "ALTER TABLE koi_todos ADD COLUMN source_type TEXT NOT NULL DEFAULT 'user'",
             "ALTER TABLE koi_todos ADD COLUMN task_timeout_secs INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE koi_todos ADD COLUMN git_branch TEXT",
+            "ALTER TABLE koi_todos ADD COLUMN integration_status TEXT NOT NULL DEFAULT 'none'",
         ] {
             let _ = self.conn.execute(col, []);
         }
@@ -3039,6 +3041,8 @@ impl Database {
             claimed_at: None,
             depends_on: depends_on.map(String::from),
             blocked_reason: None,
+            git_branch: None,
+            integration_status: Some("none".into()),
             result_message_id: None,
             source_type: source_type.to_string(),
             task_timeout_secs,
@@ -3049,7 +3053,7 @@ impl Database {
 
     const KOI_TODO_COLS: &'static str = "id, owner_id, title, description, status, priority, assigned_by, \
         pool_session_id, claimed_by, claimed_at, depends_on, blocked_reason, result_message_id, source_type, \
-        task_timeout_secs, created_at, updated_at";
+        task_timeout_secs, git_branch, integration_status, created_at, updated_at";
 
     pub fn list_koi_todos(
         &self,
@@ -3107,15 +3111,49 @@ impl Database {
                 .get::<_, String>(13)
                 .unwrap_or_else(|_| "user".to_string()),
             task_timeout_secs: r.get::<_, u32>(14).unwrap_or(0),
+            git_branch: r.get(15).ok(),
+            integration_status: r.get(16).ok(),
             created_at: r
-                .get::<_, String>(15)?
+                .get::<_, String>(17)?
                 .parse::<DateTime<Utc>>()
                 .unwrap_or_else(|_| Utc::now()),
             updated_at: r
-                .get::<_, String>(16)?
+                .get::<_, String>(18)?
                 .parse::<DateTime<Utc>>()
                 .unwrap_or_else(|_| Utc::now()),
         })
+    }
+
+    pub fn set_koi_todo_git_branch(&self, id: &str, branch: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE koi_todos SET git_branch = ?2, integration_status = CASE WHEN integration_status IN ('merged', 'conflict') THEN integration_status ELSE 'none' END, updated_at = ?3 WHERE id = ?1",
+            params![id, branch, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_koi_todo_integration_status(&self, id: &str, status: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE koi_todos SET integration_status = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, status, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_koi_todo_integration_status_by_branch(
+        &self,
+        pool_session_id: &str,
+        branch: &str,
+        status: &str,
+    ) -> Result<u32> {
+        let now = Utc::now().to_rfc3339();
+        let count = self.conn.execute(
+            "UPDATE koi_todos SET integration_status = ?3, updated_at = ?4 WHERE pool_session_id = ?1 AND git_branch = ?2",
+            params![pool_session_id, branch, status, now],
+        )?;
+        Ok(count as u32)
     }
 
     pub fn update_koi_todo(
@@ -3251,6 +3289,8 @@ impl Database {
                     claimed_at: None,
                     depends_on: Some(original.id.clone()),
                     blocked_reason: None,
+                    git_branch: None,
+                    integration_status: Some("none".into()),
                     result_message_id: None,
                     source_type: source_type.to_string(),
                     task_timeout_secs,
@@ -3269,7 +3309,9 @@ impl Database {
     pub fn complete_koi_todo(&self, id: &str, result_message_id: Option<i64>) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         self.conn.execute(
-            "UPDATE koi_todos SET status = 'done', blocked_reason = NULL, result_message_id = COALESCE(?2, result_message_id), updated_at = ?3 WHERE id = ?1",
+            "UPDATE koi_todos SET status = 'done', blocked_reason = NULL, result_message_id = COALESCE(?2, result_message_id), \
+             integration_status = CASE WHEN git_branch IS NOT NULL AND TRIM(git_branch) != '' AND integration_status NOT IN ('merged', 'conflict') THEN 'ready' ELSE integration_status END, \
+             updated_at = ?3 WHERE id = ?1",
             params![id, result_message_id, now],
         )?;
         Ok(())

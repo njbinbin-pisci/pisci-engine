@@ -1,3 +1,4 @@
+use crate::integration::{count_dependency_blocked, count_integration_ready};
 use crate::models::{KoiTodo, PoolMessage};
 use crate::scene::EventDigestMode;
 use chrono::{DateTime, Utc};
@@ -43,6 +44,10 @@ pub struct ProjectAssessment {
     pub follow_up_signal_count: usize,
     pub ready_signal_count: usize,
     pub explicit_pisci_handoff_count: usize,
+    /// Done/needs_review todos with a git branch not yet merged into main.
+    pub integration_ready_count: usize,
+    /// Todo rows waiting on an unmerged depends_on upstream.
+    pub dependency_blocked_count: usize,
     pub attention_reasons: Vec<String>,
     pub summary: String,
 }
@@ -249,6 +254,8 @@ fn build_attention_reasons(
     follow_up_signal_count: usize,
     ready_signal_count: usize,
     explicit_pisci_handoff_count: usize,
+    integration_ready_count: usize,
+    dependency_blocked_count: usize,
 ) -> Vec<String> {
     let mut reasons = Vec::new();
     if unfinished_work_count > 0 {
@@ -295,12 +302,25 @@ fn build_attention_reasons(
             ready_signal_count
         ));
     }
+    if integration_ready_count > 0 {
+        reasons.push(format!(
+            "{} branch(es) are done on the board but not merged into main — prefer incremental merge_branches, not end-of-project batch merge",
+            integration_ready_count
+        ));
+    }
+    if dependency_blocked_count > 0 {
+        reasons.push(format!(
+            "{} todo(s) are waiting on an upstream branch merge (depends_on gate)",
+            dependency_blocked_count
+        ));
+    }
     if unfinished_work_count == 0
         && blocked_todo_count == 0
         && needs_review_count == 0
         && !task_failed_still_blocks
         && follow_up_signal_count == 0
         && explicit_pisci_handoff_count == 0
+        && integration_ready_count == 0
     {
         reasons.push(
             "worker-visible work appears exhausted; Pisci must make the next global decision"
@@ -325,6 +345,8 @@ pub fn assess_project_state(
             follow_up_signal_count: 0,
             ready_signal_count: 0,
             explicit_pisci_handoff_count: 0,
+            integration_ready_count: 0,
+            dependency_blocked_count: 0,
             attention_reasons: Vec::new(),
             summary: "Project state is fully quiescent: no todos, no signals, and no observed coordination pressure.".into(),
         };
@@ -351,6 +373,8 @@ pub fn assess_project_state(
         .filter(|t| t.status == "needs_review")
         .count();
     let active_todo_count = active_todos.len();
+    let integration_ready_count = count_integration_ready(todos);
+    let dependency_blocked_count = count_dependency_blocked(todos);
 
     let recent_task_failed_count = messages
         .iter()
@@ -434,6 +458,8 @@ pub fn assess_project_state(
         follow_up_signal_count,
         ready_signal_count,
         explicit_pisci_handoff_count,
+        integration_ready_count,
+        dependency_blocked_count,
     );
 
     if unfinished_work_count > 0 {
@@ -471,6 +497,8 @@ pub fn assess_project_state(
             follow_up_signal_count,
             ready_signal_count,
             explicit_pisci_handoff_count,
+            integration_ready_count,
+            dependency_blocked_count,
             attention_reasons,
             summary,
         };
@@ -486,6 +514,8 @@ pub fn assess_project_state(
             follow_up_signal_count,
             ready_signal_count,
             explicit_pisci_handoff_count,
+            integration_ready_count,
+            dependency_blocked_count,
             attention_reasons,
             summary: format!(
                 "Project state shows no unfinished todos, but {} task_failed event(s) still have no later resolution signal. This should be escalated to the user for a human decision.",
@@ -504,6 +534,8 @@ pub fn assess_project_state(
             follow_up_signal_count,
             ready_signal_count,
             explicit_pisci_handoff_count,
+            integration_ready_count,
+            dependency_blocked_count,
             attention_reasons,
             summary: format!(
                 "Project state shows {} todo(s) waiting for review and no unfinished implementation work.",
@@ -522,6 +554,8 @@ pub fn assess_project_state(
             follow_up_signal_count,
             ready_signal_count,
             explicit_pisci_handoff_count,
+            integration_ready_count,
+            dependency_blocked_count,
             attention_reasons,
             summary: format!(
                 "Project state shows {} ready-for-review handoff(s) to @pisci and no unfinished todos.",
@@ -540,10 +574,32 @@ pub fn assess_project_state(
             follow_up_signal_count,
             ready_signal_count,
             explicit_pisci_handoff_count,
+            integration_ready_count,
+            dependency_blocked_count,
             attention_reasons,
             summary: format!(
                 "Project state shows no unfinished todos, but {} sender(s) are still asking for follow-up or waiting.",
                 follow_up_signal_count
+            ),
+        };
+    }
+
+    if integration_ready_count > 0 {
+        return ProjectAssessment {
+            decision: ProjectDecision::ReadyForPisciReview,
+            active_todo_count,
+            blocked_todo_count,
+            needs_review_count,
+            task_failed_count: recent_task_failed_count,
+            follow_up_signal_count,
+            ready_signal_count,
+            explicit_pisci_handoff_count,
+            integration_ready_count,
+            dependency_blocked_count,
+            attention_reasons,
+            summary: format!(
+                "Project state shows {} completed branch(es) awaiting merge into main. Pisci should review and merge incrementally (pool_org merge_branches), not wait for a final batch.",
+                integration_ready_count
             ),
         };
     }
@@ -558,6 +614,8 @@ pub fn assess_project_state(
             follow_up_signal_count,
             ready_signal_count,
             explicit_pisci_handoff_count,
+            integration_ready_count,
+            dependency_blocked_count,
             attention_reasons,
             summary: format!(
                 "Project state shows {} ready-for-review signal(s), but there is still no explicit ready-for-review handoff to @pisci. Pisci must inspect the pool and make the next global decision.",
@@ -575,6 +633,8 @@ pub fn assess_project_state(
         follow_up_signal_count,
         ready_signal_count,
         explicit_pisci_handoff_count,
+        integration_ready_count,
+        dependency_blocked_count,
         attention_reasons,
         summary:
             "Project state shows no unfinished todos, but there is still no explicit ready-for-review handoff to @pisci. Pisci must inspect the pool and decide what happens next."

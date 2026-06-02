@@ -79,6 +79,16 @@ pub struct AssignKoiArgs {
     /// where inputs are, how this fits into the project. Injected
     /// into the Koi's task prompt so it starts with sufficient context.
     pub context: Option<String>,
+    /// Todo id (full or prefix) that must be done — and merged if it had a branch —
+    /// before this assignment may execute.
+    pub depends_on: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MergeBranchesArgs {
+    pub pool_id: String,
+    /// Merge a single `koi/*` branch incrementally. Omit to merge all remaining branches.
+    pub branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -106,6 +116,9 @@ pub struct CreateTodoArgs {
     pub description: String,
     pub priority: String,
     pub timeout_secs: u32,
+    /// Todo id (full or prefix) that must complete — and merge if branch-backed —
+    /// before this todo may start.
+    pub depends_on: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]

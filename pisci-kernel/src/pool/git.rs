@@ -126,14 +126,36 @@ pub enum MergeOutcome {
     Error { message: String },
 }
 
-/// Walk every `koi/*` branch and merge it into `main` (falling back to
-/// `master` when `main` is missing). Aborts an individual merge on
-/// conflict and continues to the next branch.
+/// Branch name for a Koi todo worktree: `koi/<safe-name>-<short-id>`.
+pub fn koi_branch_name(koi_name: &str, todo_id: &str) -> String {
+    let short_id: String = todo_id.chars().take(8).collect();
+    let safe_name: String = koi_name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("koi/{}-{}", safe_name, short_id)
+}
+
+/// Walk `koi/*` branches and merge into `main` (or `master`).
+/// When `only_branch` is set, merge that branch only (incremental integration).
 pub async fn merge_koi_branches(
     dir: &Path,
     cancel: Option<Arc<AtomicBool>>,
+    only_branch: Option<&str>,
 ) -> anyhow::Result<Vec<MergeBranchResult>> {
-    let branches = list_koi_branches(dir, cancel.clone()).await?;
+    let mut branches = list_koi_branches(dir, cancel.clone()).await?;
+    if let Some(want) = only_branch.map(str::trim).filter(|s| !s.is_empty()) {
+        branches.retain(|b| b == want);
+        if branches.is_empty() {
+            anyhow::bail!("Branch '{}' not found among koi/* branches", want);
+        }
+    }
     if branches.is_empty() {
         return Ok(Vec::new());
     }
@@ -201,6 +223,7 @@ pub fn setup_worktree(
     if !project_dir.join(".git").exists() {
         return None;
     }
+    let branch_name = koi_branch_name(koi_name, todo_id);
     let short_id: String = todo_id.chars().take(8).collect();
     let safe_name: String = koi_name
         .chars()
@@ -212,7 +235,6 @@ pub fn setup_worktree(
             }
         })
         .collect();
-    let branch_name = format!("koi/{}-{}", safe_name, short_id);
     let wt_dir = project_dir
         .parent()
         .unwrap_or(project_dir)

@@ -28,6 +28,12 @@ Deliverable delivery rule:
 Coordination protocol:
 - If your output should be handed to another teammate, explicitly post `[ProjectStatus] follow_up_needed` and @!mention that teammate in pool_chat.
 - Only use `[ProjectStatus] ready_for_pisci_review` when your work no longer needs another teammate and is ready for Pisci to assess — and only AFTER `complete_todo` succeeds.
+- When you changed code, include this integration block in pool_chat before complete_todo:
+  Branch: koi/{name}-{todo_id}
+  Touches: <relative/paths you edited>
+  Depends-on: <upstream todo/branch or none>
+  Verify: <command you ran>
+  Ready-for-merge: yes
 
 End-of-run checklist (do ALL before stopping; missing any one triggers `needs_review` / protocol_reminder):
 1. Called pool_chat with the deliverable (or file path + summary for long results).

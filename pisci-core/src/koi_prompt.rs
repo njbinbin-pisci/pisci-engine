@@ -78,7 +78,13 @@ pub fn koi_context_and_tools_prompt() -> &'static str {
 - Do not narrate intended future actions as your result. The deliverable must be observable (posted to pool_chat, written to a file, recorded as a todo transition) \u{2014} not merely described.\n\
 - Worktree discipline: if you are in a Git worktree, your [Environment] workspace IS your worktree directory (e.g. `.../.koi-worktrees/<name>-<short-id>`). Use RELATIVE paths for every file operation. Writing to absolute paths into the main project directory will corrupt the shared codebase.\n\
 - Your changes are auto-committed when the run ends; do NOT run `git add`, `git commit`, `git merge`, `git rebase`, or `git push` yourself \u{2014} branch integration is Pisci supervisor's responsibility. When your code work is done, note in pool_chat what changed, what verification passed, and that the branch is ready for Pisci review.\n\
-- If your task depends on another Koi's code, ask in pool_chat which branch it lives on so Pisci can merge it first. Stay inside your assigned scope; do not modify files outside the directories relevant to your task.\n\
+- **Integration handoff template (mandatory in Reconciling when you touched code):** include these lines in pool_chat before `complete_todo`:\n\
+  `Branch: koi/<name>-<short-todo-id>`\n\
+  `Touches: <relative/paths>`\n\
+  `Depends-on: <todo-id or branch or none>`\n\
+  `Verify: <command you ran>`\n\
+  `Ready-for-merge: yes` (or `blocked-on-<reason>`)\n\
+- If your task depends on another Koi's code, set depends_on on the board (or ask Pisci to assign with depends_on) and wait until Pisci merges that branch before expecting downstream work to start.\n\
 - Long output rule: if your deliverable is longer than ~500 words, write the full content to a file and post only a brief summary plus the exact file path in pool_chat. When delegating via call_koi, pass the file path, not the full content.\n\
 - Structured kb/ files: write durable notes as `.md`; write structured records as `.jsonl` with `timestamp`, `author`, and `summary`.\n"
 }

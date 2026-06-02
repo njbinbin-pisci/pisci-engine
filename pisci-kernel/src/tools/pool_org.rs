@@ -15,8 +15,8 @@
 use crate::agent::tool::{Tool, ToolContext, ToolResult};
 use crate::pool::coordinator::CoordinatorConfig;
 use crate::pool::model::{
-    AssignKoiArgs, CallerContext, CreatePoolArgs, CreateTodoArgs, DeleteTodoArgs, PostStatusArgs,
-    ReplaceTodoArgs, UpdateOrgSpecArgs, UpdateTodoStatusArgs, WaitForKoiArgs,
+    AssignKoiArgs, CallerContext, CreatePoolArgs, CreateTodoArgs, DeleteTodoArgs, MergeBranchesArgs,
+    PostStatusArgs, ReplaceTodoArgs, UpdateOrgSpecArgs, UpdateTodoStatusArgs, WaitForKoiArgs,
 };
 use crate::pool::{services, PoolStore};
 use async_trait::async_trait;
@@ -114,13 +114,13 @@ impl Tool for PoolOrgTool {
          - 'replace_todo': Replace an existing todo with a new owner/task (requires todo_id, new_owner_id, task, reason). This cancels the original todo so it cannot be resumed, creates a replacement todo, and notifies the new owner. Pisci should decide when to use this. \
          - 'delete_todo': Permanently delete todo rows from the board. Use `todo_id` for a single delete, or `pool_id` plus `delete_status` / `delete_owner_id` for filtered batch cleanup (for example deleting all cancelled todos in one pool). Pisci-only. \
          - 'update_todo_status': Update a todo's status (requires todo_id, status). Pisci can change any; Koi can only change their own. Valid statuses: todo, in_progress, blocked. This changes task-board state, but teammates still need an explicit `pool_chat` update if they should react. \
-         - 'merge_branches': Pisci-only supervisor closeout action. Merge all Koi worktree branches back into the main workspace after reviewing completed Koi results (requires pool_id with project_dir). \
+         - 'merge_branches': Pisci-only supervisor integration action. Merge one Koi branch (pass branch=...) or all remaining koi/* branches into main after review. Prefer incremental single-branch merges when integration_ready todos exist on the board. \
          \
          Workflow: ALWAYS call 'list' first to see all existing pools. \
          Then use 'find_related' to search for related projects by keywords. \
          Only call 'create' if no existing pool covers the requested work — \
          if an active or paused pool is related, add tasks to it instead of creating a new pool. \
-         After creating a new pool, Pisci must use 'assign_koi' to kick off work, then call 'wait_for_koi' before judging progress. Pisci does not use pool_chat directly. When todos are done, Pisci must explicitly review and either call 'merge_branches' or request rework; Koi completion alone is not final delivery. \
+         After creating a new pool, Pisci must use 'assign_koi' to kick off work, then call 'wait_for_koi' before judging progress. Pisci does not use pool_chat directly. When todos are done, Pisci must explicitly review and merge incrementally via 'merge_branches' (optionally branch=...) or request rework; Koi completion alone is not final delivery. Use depends_on on assign_koi/create_todo to serialize waves when org_spec requires upstream merge before downstream work. \
          During heartbeat/routine checks: NEVER create new pools — only manage existing ones."
     }
 
@@ -168,7 +168,7 @@ impl Tool for PoolOrgTool {
                 "org_spec": {
                     "type": "string",
                     "description": "For create/update: the organization spec in Markdown. Should include:\n\
-                     ## Project Goal\n## Koi Roles\n## Collaboration Rules\n## Activation Conditions\n## Success Metrics"
+                     ## Project Goal\n## Koi Roles\n## Collaboration Rules\n## Integration Model (waves, file ownership, merge policy)\n## Activation Conditions\n## Success Metrics"
                 },
                 "koi_id": {
                     "type": "string",
@@ -186,6 +186,14 @@ impl Tool for PoolOrgTool {
                 "context": {
                     "type": "string",
                     "description": "For assign_koi: background context for the task — what has been done, where inputs are (file paths, previous Koi outputs), and how this task fits into the project. The Koi starts each task in a fresh session, so it only knows what you tell it and what it can read from pool_chat, the board, and kb/ files."
+                },
+                "depends_on": {
+                    "type": "string",
+                    "description": "For assign_koi/create_todo: optional todo id (full or prefix) that must be done — and merged if branch-backed — before this todo may start."
+                },
+                "branch": {
+                    "type": "string",
+                    "description": "For merge_branches: optional single koi/* branch to merge incrementally. Omit to merge all remaining koi/* branches."
                 },
                 "timeout_secs": {
                     "type": "integer",
@@ -330,6 +338,10 @@ impl Tool for PoolOrgTool {
                     priority: input["priority"].as_str().unwrap_or("medium").to_string(),
                     timeout_secs: input["timeout_secs"].as_u64().unwrap_or(0) as u32,
                     context: input["context"].as_str().map(|s| s.to_string()).filter(|s| !s.is_empty()),
+                    depends_on: input["depends_on"]
+                        .as_str()
+                        .map(|s| s.to_string())
+                        .filter(|s| !s.trim().is_empty()),
                 };
                 match services::assign_koi(
                     &self.store,
@@ -421,6 +433,10 @@ impl Tool for PoolOrgTool {
                     description: input["description"].as_str().unwrap_or("").to_string(),
                     priority: input["priority"].as_str().unwrap_or("medium").to_string(),
                     timeout_secs: input["timeout_secs"].as_u64().unwrap_or(0) as u32,
+                    depends_on: input["depends_on"]
+                        .as_str()
+                        .map(|s| s.to_string())
+                        .filter(|s| !s.trim().is_empty()),
                 };
                 match services::create_todo(&self.store, &*self.sink, &caller, args).await {
                     Ok(v) => Ok(ToolResult::ok(Self::summary_of(&v))),
@@ -544,8 +560,14 @@ impl Tool for PoolOrgTool {
                 }
             }
             "merge_branches" => {
-                let pool_id = input["pool_id"].as_str().unwrap_or("");
-                match services::merge_branches(&self.store, &caller, pool_id).await {
+                let args = MergeBranchesArgs {
+                    pool_id: input["pool_id"].as_str().unwrap_or("").to_string(),
+                    branch: input["branch"]
+                        .as_str()
+                        .map(|s| s.to_string())
+                        .filter(|s| !s.trim().is_empty()),
+                };
+                match services::merge_branches(&self.store, &caller, &args).await {
                     Ok(v) => Ok(ToolResult::ok(Self::summary_of(&v))),
                     Err(e) => Ok(ToolResult::err(e.to_string())),
                 }

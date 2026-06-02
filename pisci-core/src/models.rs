@@ -15,6 +15,12 @@ pub struct KoiTodo {
     pub claimed_at: Option<DateTime<Utc>>,
     pub depends_on: Option<String>,
     pub blocked_reason: Option<String>,
+    /// Git branch created for this todo's worktree, e.g. `koi/coder-a1b2c3d4`.
+    #[serde(default)]
+    pub git_branch: Option<String>,
+    /// Integration lifecycle: none | ready | merged | conflict.
+    #[serde(default)]
+    pub integration_status: Option<String>,
     pub result_message_id: Option<i64>,
     pub source_type: String,
     #[serde(default)]

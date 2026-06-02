@@ -108,6 +108,8 @@ pub fn build_pool_heartbeat_message(base_prompt: &str, attention: &PoolAttention
         format!("- Active todos: {}", assessment.active_todo_count),
         format!("- Blocked todos: {}", assessment.blocked_todo_count),
         format!("- Needs-review todos: {}", assessment.needs_review_count),
+        format!("- Integration-ready branches: {}", assessment.integration_ready_count),
+        format!("- Dependency-blocked todos: {}", assessment.dependency_blocked_count),
         format!("- task_failed events: {}", assessment.task_failed_count),
         format!("- Follow-up signals: {}", assessment.follow_up_signal_count),
         format!("- Assessment: {}", assessment.summary),
@@ -194,6 +196,12 @@ pub fn build_pool_heartbeat_message(base_prompt: &str, attention: &PoolAttention
                 "The snapshot is compatible with Pisci review, but HEARTBEAT_OK is forbidden as the only action when needs_review todos exist."
                     .to_string(),
             );
+            if assessment.integration_ready_count > 0 {
+                lines.push(format!(
+                    "{} branch(es) are done on the board but not merged. Prefer pool_org(merge_branches, branch=<one branch>) incrementally after reviewing get_messages/get_todos — do not wait for a final batch merge of every koi/* branch.",
+                    assessment.integration_ready_count
+                ));
+            }
             lines.push(
                 "Mandatory closeout: call pool_org(action=\"get_messages\") and pool_org(action=\"get_todos\") for this pool, inspect the reported deliverables, then choose exactly one outcome: merge_branches if the work is acceptable, resume_todo/replace_todo/assign_koi if rework is needed, or post_status plus notify_user when human review is required."
                     .to_string(),

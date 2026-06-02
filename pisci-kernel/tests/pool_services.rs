@@ -308,6 +308,7 @@ async fn archive_rejects_pool_with_active_todos() {
             description: "do it".into(),
             priority: "".into(),
             timeout_secs: 0,
+            depends_on: None,
         },
     )
     .await
@@ -341,6 +342,7 @@ async fn koi_can_only_manage_its_own_todos() {
             description: "".into(),
             priority: "".into(),
             timeout_secs: 0,
+            depends_on: None,
         },
     )
     .await
@@ -393,6 +395,7 @@ async fn assign_koi_creates_todo_posts_mention_and_emits_events() {
             priority: "high".into(),
             timeout_secs: 30,
             context: None,
+            depends_on: None,
         },
     )
     .await
@@ -471,6 +474,7 @@ async fn wait_for_koi_uses_elapsed_time_before_timeout() {
             description: "".into(),
             priority: "".into(),
             timeout_secs: 0,
+            depends_on: None,
         },
     )
     .await
@@ -737,6 +741,7 @@ async fn delete_todo_can_batch_delete_cancelled_items_in_pool() {
             description: "".into(),
             priority: "".into(),
             timeout_secs: 0,
+            depends_on: None,
         },
     )
     .await
@@ -756,6 +761,7 @@ async fn delete_todo_can_batch_delete_cancelled_items_in_pool() {
             description: "".into(),
             priority: "".into(),
             timeout_secs: 0,
+            depends_on: None,
         },
     )
     .await

@@ -9,6 +9,7 @@
 
 pub mod heartbeat;
 pub mod host;
+pub mod integration;
 pub mod koi_prompt;
 pub mod models;
 pub mod project_state;
