@@ -1,10 +1,12 @@
 pub mod bench_compact;
 pub mod compaction;
 pub mod compaction_strategy;
+pub mod contrib;
 pub mod file_journal;
 pub mod harness;
 pub mod hooks;
 pub mod loop_;
+pub mod loop_strategy;
 pub mod message_utils;
 pub mod messages;
 pub mod plan;

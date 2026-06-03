@@ -940,6 +940,257 @@ impl DefaultCompaction {
     }
 }
 
+/// Returns true when `msg` begins with a `ToolResult` block, i.e. it is the
+/// reply to a previous `ToolUse`. Such a message must never be the first kept
+/// message in a truncated window, or the provider rejects the orphaned result.
+fn starts_with_tool_result(msg: &LlmMessage) -> bool {
+    matches!(
+        &msg.content,
+        MessageContent::Blocks(blocks)
+            if blocks.first().map(|b| matches!(b, ContentBlock::ToolResult { .. })).unwrap_or(false)
+    )
+}
+
+/// Whether a message is plain conversational text (no tool_use / tool_result),
+/// safe to re-insert out of strict adjacency during relevance retrieval.
+fn is_plain_text_message(msg: &LlmMessage) -> bool {
+    match &msg.content {
+        MessageContent::Text(_) => true,
+        MessageContent::Blocks(blocks) => blocks
+            .iter()
+            .all(|b| matches!(b, ContentBlock::Text { .. } | ContentBlock::Image { .. })),
+    }
+}
+
+/// Pick the largest suffix of `messages` whose estimated tokens fit within
+/// `keep_tokens`, then advance forward past any orphaned leading tool-result
+/// message. Returns `(cut_index, kept)` where `cut_index` is how many leading
+/// messages were dropped.
+fn select_recent_window(messages: &[LlmMessage], keep_tokens: usize) -> usize {
+    let mut acc = 0usize;
+    let mut cut = messages.len();
+    for (idx, msg) in messages.iter().enumerate().rev() {
+        let cost = crate::llm::estimate_message_tokens(msg);
+        if acc + cost > keep_tokens && idx + 1 < messages.len() {
+            cut = idx + 1;
+            break;
+        }
+        acc += cost;
+        cut = idx;
+    }
+    // Never orphan a leading tool-result.
+    while cut < messages.len() && starts_with_tool_result(&messages[cut]) {
+        cut += 1;
+    }
+    cut
+}
+
+/// Token-budget truncation with no LLM call. Keeps the newest messages that fit
+/// within `keep_ratio` of the message budget and drops older ones. Preserves
+/// tool_use/tool_result adjacency by never starting the window on a tool
+/// result. Does not produce a rolling summary (history before the window is
+/// discarded), so it trades fidelity for zero summariser cost and latency.
+pub struct SlidingWindowCompaction {
+    /// Fraction of the message budget to retain (newest-first).
+    pub keep_ratio: f64,
+}
+
+impl Default for SlidingWindowCompaction {
+    fn default() -> Self {
+        Self {
+            keep_ratio: SUMMARY_KEEP_RECENT_RATIO,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl CompactionStrategy for SlidingWindowCompaction {
+    async fn compact(&self, req: CompactionRequest<'_>) -> CompactionResult {
+        let total_budget =
+            crate::llm::compute_total_input_budget(req.context_window, req.max_tokens);
+        let static_overhead_tokens =
+            crate::llm::estimate_request_overhead_tokens(Some(req.system_prompt), req.tool_defs);
+        let message_budget = total_budget.saturating_sub(static_overhead_tokens);
+        // Overflow recovery shrinks harder than the proactive pass.
+        let ratio = match req.trigger {
+            CompactionTrigger::Proactive => self.keep_ratio,
+            CompactionTrigger::Overflow => self.keep_ratio * 0.5,
+        };
+        let keep_tokens = (message_budget as f64 * ratio) as usize;
+
+        // Proactive path only acts once over the 60% safety line.
+        if matches!(req.trigger, CompactionTrigger::Proactive) {
+            let estimated =
+                crate::llm::estimate_request_input_tokens(&req.messages, Some(req.system_prompt), req.tool_defs);
+            if estimated <= (total_budget as f64 * 0.60) as usize {
+                return CompactionResult {
+                    changed: false,
+                    messages: req.messages,
+                    rolling_summary: req.rolling_summary.to_string(),
+                    next_auto_compact_threshold: req.next_auto_compact_threshold,
+                    ..Default::default()
+                };
+            }
+        }
+
+        let cut = select_recent_window(&req.messages, keep_tokens);
+        if cut == 0 {
+            return CompactionResult {
+                changed: false,
+                messages: req.messages,
+                rolling_summary: req.rolling_summary.to_string(),
+                next_auto_compact_threshold: req.next_auto_compact_threshold,
+                ..Default::default()
+            };
+        }
+        let kept = req.messages[cut..].to_vec();
+        CompactionResult {
+            changed: true,
+            messages: kept,
+            rolling_summary: req.rolling_summary.to_string(),
+            next_auto_compact_threshold: req.next_auto_compact_threshold,
+            ..Default::default()
+        }
+    }
+}
+
+/// Relevance-based retention. Keeps the newest window (like the sliding window)
+/// and, from the messages that would otherwise be dropped, re-introduces the
+/// top-k plain-text messages most relevant to the latest user turn — scored
+/// with [`crate::memory::vector::cosine_similarity`] over a hashed
+/// bag-of-words embedding. Tool-call messages are excluded from retrieval to
+/// avoid orphaning tool_use/tool_result pairs.
+pub struct VectorRetrievalCompaction {
+    pub keep_ratio: f64,
+    pub top_k: usize,
+}
+
+impl Default for VectorRetrievalCompaction {
+    fn default() -> Self {
+        Self {
+            keep_ratio: SUMMARY_KEEP_RECENT_RATIO * 0.5,
+            top_k: 4,
+        }
+    }
+}
+
+/// Hashed bag-of-words embedding so we can reuse cosine similarity without an
+/// external embedding model. Deterministic and cheap; good enough for ranking.
+fn bow_embed(text: &str, dims: usize) -> Vec<f32> {
+    let mut v = vec![0f32; dims];
+    for tok in text
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+    {
+        let mut h: usize = 0;
+        for b in tok.bytes() {
+            h = h.wrapping_mul(31).wrapping_add(b as usize);
+        }
+        v[h % dims] += 1.0;
+    }
+    v
+}
+
+#[async_trait::async_trait]
+impl CompactionStrategy for VectorRetrievalCompaction {
+    async fn compact(&self, req: CompactionRequest<'_>) -> CompactionResult {
+        let total_budget =
+            crate::llm::compute_total_input_budget(req.context_window, req.max_tokens);
+        let static_overhead_tokens =
+            crate::llm::estimate_request_overhead_tokens(Some(req.system_prompt), req.tool_defs);
+        let message_budget = total_budget.saturating_sub(static_overhead_tokens);
+
+        if matches!(req.trigger, CompactionTrigger::Proactive) {
+            let estimated =
+                crate::llm::estimate_request_input_tokens(&req.messages, Some(req.system_prompt), req.tool_defs);
+            if estimated <= (total_budget as f64 * 0.60) as usize {
+                return CompactionResult {
+                    changed: false,
+                    messages: req.messages,
+                    rolling_summary: req.rolling_summary.to_string(),
+                    next_auto_compact_threshold: req.next_auto_compact_threshold,
+                    ..Default::default()
+                };
+            }
+        }
+
+        let keep_tokens = (message_budget as f64 * self.keep_ratio) as usize;
+        let cut = select_recent_window(&req.messages, keep_tokens);
+        if cut == 0 {
+            return CompactionResult {
+                changed: false,
+                messages: req.messages,
+                rolling_summary: req.rolling_summary.to_string(),
+                next_auto_compact_threshold: req.next_auto_compact_threshold,
+                ..Default::default()
+            };
+        }
+
+        // Latest user turn as the retrieval query.
+        let query_text = req
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .map(|m| m.content.as_text())
+            .unwrap_or_default();
+
+        const DIMS: usize = 256;
+        let query_vec = bow_embed(&query_text, DIMS);
+
+        // Rank dropped plain-text messages by similarity to the query.
+        let mut scored: Vec<(usize, f32)> = req.messages[..cut]
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| is_plain_text_message(m))
+            .map(|(idx, m)| {
+                let cand = bow_embed(&m.content.as_text(), DIMS);
+                (idx, crate::memory::vector::cosine_similarity(&query_vec, &cand))
+            })
+            .filter(|(_, s)| *s > 0.0)
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(self.top_k);
+        // Restore chronological order for the retained, retrieved messages.
+        let mut keep_idx: Vec<usize> = scored.into_iter().map(|(i, _)| i).collect();
+        keep_idx.sort_unstable();
+
+        let mut kept: Vec<LlmMessage> =
+            keep_idx.iter().map(|&i| req.messages[i].clone()).collect();
+        kept.extend_from_slice(&req.messages[cut..]);
+
+        CompactionResult {
+            changed: true,
+            messages: kept,
+            rolling_summary: req.rolling_summary.to_string(),
+            next_auto_compact_threshold: req.next_auto_compact_threshold,
+            ..Default::default()
+        }
+    }
+}
+
+/// Resolve a named compaction strategy to a shared trait object.
+///
+/// `summarizer_prompt` is reserved for summary-based strategies (currently the
+/// kernel summariser uses its own internal prompt; the override is accepted for
+/// forward compatibility). Returns `None` for unknown names so callers can fail
+/// loudly on configuration typos.
+pub fn resolve_compaction_strategy(
+    name: &str,
+    summarizer_prompt: Option<String>,
+) -> Option<Arc<dyn CompactionStrategy>> {
+    let _ = summarizer_prompt;
+    match name {
+        "" | "default" | "summary_based" => Some(Arc::new(DefaultCompaction)),
+        "sliding_window" => Some(Arc::new(SlidingWindowCompaction::default())),
+        "vector_retrieval" => Some(Arc::new(VectorRetrievalCompaction::default())),
+        // Fall through to host-registered contrib strategies so newly authored
+        // compaction algorithms are selectable without editing this match.
+        _ => crate::agent::contrib::resolve_compaction_strategy(name),
+    }
+}
+
 /// Serialize a batch of `ContentBlock::ToolResult` blocks into the DB's
 /// `tool_results_json` column.
 ///
@@ -1699,6 +1950,23 @@ pub struct AgentLoop {
     /// Proactive context-compaction policy. Hosts may swap this; defaults to
     /// [`DefaultCompaction`] which reproduces the built-in behavior.
     pub compaction_strategy: Arc<dyn CompactionStrategy>,
+    /// Optional pluggable long-term memory backend. When set, the loop retrieves
+    /// relevant memories at run start and injects them into the system prompt
+    /// (formatted by [`Self::memory_retrieval_prompt`]). `None` => no memory
+    /// injection (behaviour-preserving default).
+    pub memory_plugin: Option<Arc<dyn crate::memory::plugin::MemoryPlugin>>,
+    /// Optional pluggable project-context discovery strategy. When set, the loop
+    /// renders project instructions from the workspace root and prepends them to
+    /// the system prompt. `None` => the host injects context by other means.
+    pub context_manager: Option<Arc<dyn crate::context::ContextManager>>,
+    /// Optional template used to format retrieved memories before they are
+    /// appended to the system prompt. The literal `{memories}` placeholder is
+    /// replaced with the rendered hit list; when absent the hits are appended
+    /// after the template text. `None` uses a built-in default heading.
+    pub memory_retrieval_prompt: Option<String>,
+    /// Optional pluggable loop-control strategy (context transform, stop, and
+    /// next-turn hooks). `None` uses the kernel's built-in ReAct control flow.
+    pub loop_strategy: Option<Arc<dyn crate::agent::loop_strategy::LoopStrategy>>,
 }
 
 impl AgentLoop {
@@ -2361,6 +2629,74 @@ impl AgentLoop {
         }
     }
 
+    /// Compose the effective system prompt for this run.
+    ///
+    /// Layers, in order: discovered project context (when a
+    /// [`context_manager`](Self::context_manager) is wired), the base system
+    /// prompt, then retrieved long-term memories (when a
+    /// [`memory_plugin`](Self::memory_plugin) is wired). When neither optional
+    /// plugin is set this returns [`Self::system_prompt`] verbatim, so the
+    /// default code path is byte-for-byte unchanged.
+    fn compose_system_prompt(&self, messages: &[LlmMessage], ctx: &ToolContext) -> String {
+        if self.context_manager.is_none() && self.memory_plugin.is_none() {
+            return self.system_prompt.clone();
+        }
+
+        let mut prompt = String::new();
+
+        // L_context: project instructions discovered from the workspace root.
+        if let Some(mgr) = &self.context_manager {
+            if let Ok(rendered) = mgr.render(
+                &ctx.workspace_root,
+                crate::context::DEFAULT_CONTEXT_BUDGET_CHARS,
+            ) {
+                if !rendered.trim().is_empty() {
+                    prompt.push_str(rendered.trim_end());
+                    prompt.push_str("\n\n");
+                }
+            }
+        }
+
+        prompt.push_str(&self.system_prompt);
+
+        // L_memory: retrieve relevant memories keyed off the latest user turn.
+        if let Some(mem) = &self.memory_plugin {
+            let query_text = messages
+                .iter()
+                .rev()
+                .find(|m| m.role == "user")
+                .map(|m| m.content.as_text())
+                .unwrap_or_default();
+            if !query_text.trim().is_empty() {
+                let query = crate::memory::plugin::MemoryQuery {
+                    text: Some(query_text),
+                    limit: 5,
+                    ..Default::default()
+                };
+                if let Ok(hits) = mem.search(&query) {
+                    if !hits.is_empty() {
+                        let rendered: String = hits
+                            .iter()
+                            .map(|h| format!("- {}", h.entry.content))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let block = match &self.memory_retrieval_prompt {
+                            Some(tpl) if tpl.contains("{memories}") => {
+                                tpl.replace("{memories}", &rendered)
+                            }
+                            Some(tpl) => format!("{tpl}\n{rendered}"),
+                            None => format!("## Relevant Memories\n{rendered}"),
+                        };
+                        prompt.push_str("\n\n");
+                        prompt.push_str(&block);
+                    }
+                }
+            }
+        }
+
+        prompt
+    }
+
     ///
     /// NOTE: The caller is responsible for emitting `AgentEvent::Done` AFTER persisting
     /// the result to the database, to avoid a race condition where the frontend reloads
@@ -2458,6 +2794,11 @@ impl AgentLoop {
             }
         }
 
+        // Compose the effective system prompt once per run, folding in any
+        // wired context-manager / memory-plugin output. Falls back to the base
+        // prompt verbatim when neither is set (behaviour-preserving default).
+        let effective_system_prompt = self.compose_system_prompt(&messages, &ctx);
+
         let max_iterations = ctx.max_iterations.unwrap_or(DEFAULT_MAX_ITERATIONS as u32) as usize;
         let mut loop_detector = LoopDetectorState {
             history: restored_loop_history.unwrap_or_default(),
@@ -2493,6 +2834,10 @@ impl AgentLoop {
         } else {
             i64::MAX
         };
+
+        // Loop-strategy turn tracking (fed into `prepare_next_turn`).
+        let mut last_turn_had_tool_calls = false;
+        let mut last_turn_text = String::new();
 
         for _iteration in 0..max_iterations {
             if cancel.load(Ordering::Relaxed) {
@@ -2531,7 +2876,7 @@ impl AgentLoop {
                 let total_budget =
                     crate::llm::compute_total_input_budget(self.context_window, self.max_tokens);
                 let static_overhead_tokens = crate::llm::estimate_request_overhead_tokens(
-                    Some(&self.system_prompt),
+                    Some(&effective_system_prompt),
                     &tool_defs,
                 );
                 let message_budget = total_budget.saturating_sub(static_overhead_tokens);
@@ -2544,7 +2889,7 @@ impl AgentLoop {
                         trigger: CompactionTrigger::Proactive,
                         messages: messages.clone(),
                         rolling_summary: &rolling_summary,
-                        system_prompt: &self.system_prompt,
+                        system_prompt: &effective_system_prompt,
                         model: &self.model,
                         max_tokens: self.max_tokens,
                         context_window: self.context_window,
@@ -2613,7 +2958,7 @@ impl AgentLoop {
                 let req_view = vision::inject_selected_context(&demoted, &ctx.session_id).await;
                 let estimated = crate::llm::estimate_request_input_tokens(
                     &req_view,
-                    Some(&self.system_prompt),
+                    Some(&effective_system_prompt),
                     &tool_defs,
                 );
                 let trigger_threshold = (total_budget as f64 * 0.60) as usize;
@@ -2627,7 +2972,7 @@ impl AgentLoop {
                     };
                     let bd = crate::agent::harness::context_builder::compute_layered_breakdown(
                         &req_view,
-                        Some(&self.system_prompt),
+                        Some(&effective_system_prompt),
                         &tool_defs,
                         &tool_minimals,
                         rolling_tokens,
@@ -2690,7 +3035,22 @@ impl AgentLoop {
             info!("calling LLM: model={}", self.model);
             let mut cancelled_partial_text: Option<String> = None;
             let response = {
-                let models_to_try: Vec<String> = std::iter::once(self.model.clone())
+                // Loop-strategy next-turn hint may override the primary model
+                // for this iteration (default: no override).
+                let primary_model = self
+                    .loop_strategy
+                    .as_ref()
+                    .and_then(|strat| {
+                        strat
+                            .prepare_next_turn(&crate::agent::loop_strategy::TurnContext {
+                                iteration: _iteration,
+                                had_tool_calls: last_turn_had_tool_calls,
+                                last_text: last_turn_text.clone(),
+                            })
+                            .model
+                    })
+                    .unwrap_or_else(|| self.model.clone());
+                let models_to_try: Vec<String> = std::iter::once(primary_model)
                     .chain(self.fallback_models.iter().cloned())
                     .collect();
                 let mut last_err: Option<anyhow::Error> = None;
@@ -2753,6 +3113,13 @@ impl AgentLoop {
                         vision::clear_selection(&ctx.session_id).await;
                         req_messages
                     };
+                    // Loop-strategy context transform: last chance for a host
+                    // policy to reshape the exact message list going on the wire
+                    // (default is identity, so behaviour is unchanged).
+                    let req_messages = match &self.loop_strategy {
+                        Some(strat) => strat.transform_context(req_messages),
+                        None => req_messages,
+                    };
                     // Route through RequestBuilder so provider-specific
                     // ceilings (e.g. Anthropic's 8192 max_tokens cap) are
                     // applied in one place instead of leaking into every
@@ -2764,7 +3131,7 @@ impl AgentLoop {
                         crate::agent::harness::ProviderKind::from_model_id(model_candidate);
                     let req = crate::agent::harness::RequestBuilder::new(
                         req_messages,
-                        Some(self.system_prompt.clone()),
+                        Some(effective_system_prompt.clone()),
                         tool_defs.clone(),
                         model_candidate.clone(),
                         self.max_tokens,
@@ -2849,7 +3216,7 @@ impl AgentLoop {
                                             trigger: CompactionTrigger::Overflow,
                                             messages: messages.clone(),
                                             rolling_summary: &rolling_summary,
-                                            system_prompt: &self.system_prompt,
+                                            system_prompt: &effective_system_prompt,
                                             model: model_candidate,
                                             max_tokens: self.max_tokens,
                                             context_window: self.context_window,
@@ -3388,6 +3755,26 @@ impl AgentLoop {
                         }
                     }
                     Err(e) => warn!("Failed to serialise checkpoint messages: {}", e),
+                }
+            }
+
+            // Loop-strategy turn boundary: record turn state for the next-turn
+            // hint, and honour an explicit early-stop request (default: never).
+            last_turn_had_tool_calls = !tool_calls.is_empty();
+            last_turn_text = text_buf.clone();
+            if let Some(strat) = &self.loop_strategy {
+                let turn = crate::agent::loop_strategy::TurnContext {
+                    iteration: _iteration,
+                    had_tool_calls: last_turn_had_tool_calls,
+                    last_text: last_turn_text.clone(),
+                };
+                if strat.should_stop_after_turn(&turn) {
+                    info!(
+                        "loop strategy '{}' requested stop after turn {}",
+                        strat.name(),
+                        _iteration + 1
+                    );
+                    break;
                 }
             }
         }
@@ -3971,6 +4358,10 @@ mod tests {
             enable_streaming: true,
             hooks: None,
             compaction_strategy: Arc::new(super::DefaultCompaction),
+            memory_plugin: None,
+            context_manager: None,
+            memory_retrieval_prompt: None,
+            loop_strategy: None,
         };
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(16);
         let ctx = ToolContext {

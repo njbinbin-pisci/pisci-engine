@@ -215,6 +215,14 @@ pub struct HarnessConfig {
     /// plugin is wired (ephemeral). When set, hosts can store / retrieve
     /// memories through a uniform interface.
     pub memory_plugin: Option<Arc<dyn crate::memory::plugin::MemoryPlugin>>,
+    /// Optional template used to format retrieved memories into the system
+    /// prompt. `{memories}` is replaced with the rendered hit list. `None`
+    /// uses the loop's built-in default heading. Only meaningful when
+    /// `memory_plugin` is set.
+    pub memory_retrieval_prompt: Option<String>,
+    /// Optional pluggable loop-control strategy. `None` uses the kernel's
+    /// built-in ReAct control flow.
+    pub loop_strategy: Option<Arc<dyn crate::agent::loop_strategy::LoopStrategy>>,
 }
 
 impl HarnessConfig {
@@ -506,6 +514,10 @@ impl HarnessConfig {
             compaction_strategy: self
                 .compaction_strategy
                 .unwrap_or_else(|| Arc::new(crate::agent::loop_::DefaultCompaction)),
+            memory_plugin: self.memory_plugin,
+            context_manager: self.context_manager,
+            memory_retrieval_prompt: self.memory_retrieval_prompt,
+            loop_strategy: self.loop_strategy,
         }
     }
 }
@@ -550,6 +562,8 @@ impl HarnessConfigBuilder {
             compaction_strategy: None,
             context_manager: None,
             memory_plugin: None,
+            memory_retrieval_prompt: None,
+            loop_strategy: None,
         };
         Self { inner }
     }
@@ -575,6 +589,22 @@ impl HarnessConfigBuilder {
         memory: Arc<dyn crate::memory::plugin::MemoryPlugin>,
     ) -> Self {
         self.inner.memory_plugin = Some(memory);
+        self
+    }
+
+    /// Set the template used to format retrieved memories into the prompt.
+    /// Empty strings are treated as `None`.
+    pub fn with_memory_retrieval_prompt(mut self, tpl: Option<String>) -> Self {
+        self.inner.memory_retrieval_prompt = tpl.filter(|s| !s.trim().is_empty());
+        self
+    }
+
+    /// Wire a pluggable loop-control strategy.
+    pub fn with_loop_strategy(
+        mut self,
+        strategy: Arc<dyn crate::agent::loop_strategy::LoopStrategy>,
+    ) -> Self {
+        self.inner.loop_strategy = Some(strategy);
         self
     }
 
