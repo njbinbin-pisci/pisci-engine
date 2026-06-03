@@ -207,6 +207,14 @@ pub struct HarnessConfig {
     /// Optional pluggable compaction policy. `None` uses the kernel's built-in
     /// [`crate::agent::loop_::DefaultCompaction`].
     pub compaction_strategy: Option<Arc<dyn crate::agent::compaction_strategy::CompactionStrategy>>,
+    /// Optional pluggable project-context discovery strategy. `None` means the
+    /// host injects context by other means (the legacy behaviour); when set,
+    /// callers can resolve project instructions through this strategy.
+    pub context_manager: Option<Arc<dyn crate::context::ContextManager>>,
+    /// Optional pluggable long-term memory backend. `None` means no memory
+    /// plugin is wired (ephemeral). When set, hosts can store / retrieve
+    /// memories through a uniform interface.
+    pub memory_plugin: Option<Arc<dyn crate::memory::plugin::MemoryPlugin>>,
 }
 
 impl HarnessConfig {
@@ -219,6 +227,25 @@ impl HarnessConfig {
         policy: Arc<PolicyGate>,
     ) -> HarnessConfigBuilder {
         HarnessConfigBuilder::new(scene, model, registry, policy)
+    }
+
+    /// Render project-context instructions using the configured
+    /// [`context_manager`](Self::context_manager), falling back to the default
+    /// [`crate::context::ProjectContextManager`] when none is wired.
+    ///
+    /// This is behaviour-preserving: with no manager set the output is
+    /// identical to the legacy [`crate::project_context`] code path, so hosts
+    /// can adopt it without changing existing prompts.
+    pub fn render_project_context(
+        &self,
+        root: &std::path::Path,
+        budget_chars: usize,
+    ) -> std::io::Result<String> {
+        use crate::context::ContextManager as _;
+        match &self.context_manager {
+            Some(mgr) => mgr.render(root, budget_chars),
+            None => crate::context::ProjectContextManager.render(root, budget_chars),
+        }
     }
 
     // ── Scene factories ────────────────────────────────────────────────
@@ -521,6 +548,8 @@ impl HarnessConfigBuilder {
             summary_model: None,
             hooks: None,
             compaction_strategy: None,
+            context_manager: None,
+            memory_plugin: None,
         };
         Self { inner }
     }
@@ -528,6 +557,24 @@ impl HarnessConfigBuilder {
     /// Wire host lifecycle hooks into the loop.
     pub fn with_hooks(mut self, hooks: Arc<dyn crate::agent::hooks::AgentHooks>) -> Self {
         self.inner.hooks = Some(hooks);
+        self
+    }
+
+    /// Wire a pluggable project-context discovery strategy.
+    pub fn with_context_manager(
+        mut self,
+        manager: Arc<dyn crate::context::ContextManager>,
+    ) -> Self {
+        self.inner.context_manager = Some(manager);
+        self
+    }
+
+    /// Wire a pluggable long-term memory backend.
+    pub fn with_memory_plugin(
+        mut self,
+        memory: Arc<dyn crate::memory::plugin::MemoryPlugin>,
+    ) -> Self {
+        self.inner.memory_plugin = Some(memory);
         self
     }
 
