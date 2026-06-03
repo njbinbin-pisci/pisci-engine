@@ -132,7 +132,10 @@ mod tests {
             resolve_loop_strategy("plan_and_solve").unwrap().name(),
             "plan_and_solve"
         );
-        assert_eq!(resolve_loop_strategy("reflexion").unwrap().name(), "reflexion");
+        assert_eq!(
+            resolve_loop_strategy("reflexion").unwrap().name(),
+            "reflexion"
+        );
         assert!(resolve_loop_strategy("bogus").is_none());
     }
 

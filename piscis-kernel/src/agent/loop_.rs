@@ -1020,8 +1020,11 @@ impl CompactionStrategy for SlidingWindowCompaction {
 
         // Proactive path only acts once over the 60% safety line.
         if matches!(req.trigger, CompactionTrigger::Proactive) {
-            let estimated =
-                crate::llm::estimate_request_input_tokens(&req.messages, Some(req.system_prompt), req.tool_defs);
+            let estimated = crate::llm::estimate_request_input_tokens(
+                &req.messages,
+                Some(req.system_prompt),
+                req.tool_defs,
+            );
             if estimated <= (total_budget as f64 * 0.60) as usize {
                 return CompactionResult {
                     changed: false,
@@ -1102,8 +1105,11 @@ impl CompactionStrategy for VectorRetrievalCompaction {
         let message_budget = total_budget.saturating_sub(static_overhead_tokens);
 
         if matches!(req.trigger, CompactionTrigger::Proactive) {
-            let estimated =
-                crate::llm::estimate_request_input_tokens(&req.messages, Some(req.system_prompt), req.tool_defs);
+            let estimated = crate::llm::estimate_request_input_tokens(
+                &req.messages,
+                Some(req.system_prompt),
+                req.tool_defs,
+            );
             if estimated <= (total_budget as f64 * 0.60) as usize {
                 return CompactionResult {
                     changed: false,
@@ -1146,7 +1152,10 @@ impl CompactionStrategy for VectorRetrievalCompaction {
             .filter(|(_, m)| is_plain_text_message(m))
             .map(|(idx, m)| {
                 let cand = bow_embed(&m.content.as_text(), DIMS);
-                (idx, crate::memory::vector::cosine_similarity(&query_vec, &cand))
+                (
+                    idx,
+                    crate::memory::vector::cosine_similarity(&query_vec, &cand),
+                )
             })
             .filter(|(_, s)| *s > 0.0)
             .collect();
@@ -1156,8 +1165,7 @@ impl CompactionStrategy for VectorRetrievalCompaction {
         let mut keep_idx: Vec<usize> = scored.into_iter().map(|(i, _)| i).collect();
         keep_idx.sort_unstable();
 
-        let mut kept: Vec<LlmMessage> =
-            keep_idx.iter().map(|&i| req.messages[i].clone()).collect();
+        let mut kept: Vec<LlmMessage> = keep_idx.iter().map(|&i| req.messages[i].clone()).collect();
         kept.extend_from_slice(&req.messages[cut..]);
 
         CompactionResult {
