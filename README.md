@@ -43,8 +43,8 @@ a host's `Cargo.toml` references:
 [dependencies]
 piscis-core   = { path = "../../piscis-engine/piscis-core" }
 piscis-kernel = { path = "../../piscis-engine/piscis-kernel" }
-# Swap for a git source once this repo has a published remote:
-# piscis-kernel = { git = "https://…/piscis-engine", package = "piscis-kernel" }
+# Git dependency (pin rev across hosts — keep in sync with openpiscis / CodeZ / agent-workbench):
+# piscis-kernel = { git = "https://github.com/njbinbin-piscis/piscis-engine.git", package = "piscis-kernel", rev = "v0.8.38" }
 ```
 
 ## Provenance
