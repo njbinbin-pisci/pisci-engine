@@ -45,6 +45,11 @@ pub struct PoolSession {
     /// from the desktop chat or via CLI/headless paths.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_im_binding_key: Option<String>,
+    /// Ids of the Koi that are members of this project pool. Only members
+    /// appear as participants and can be assigned work. Populated by the
+    /// store on list/get; defaults to empty when not hydrated.
+    #[serde(default)]
+    pub member_koi_ids: Vec<String>,
     pub last_active_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

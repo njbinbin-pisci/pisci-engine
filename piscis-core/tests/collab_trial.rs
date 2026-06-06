@@ -69,6 +69,7 @@ fn sample_pool() -> PoolSession {
         project_dir: Some("C:/demo".into()),
         task_timeout_secs: 0,
         origin_im_binding_key: None,
+        member_koi_ids: Vec::new(),
         last_active_at: Some(now),
         created_at: now,
         updated_at: now,

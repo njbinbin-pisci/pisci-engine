@@ -98,7 +98,10 @@ impl Tool for PoolOrgTool {
          - 'read': Read the org_spec for an existing pool. \
          - 'update': Update the org_spec for an existing pool. \
          - 'list': List all project pools with their status. \
-         - 'assign_koi': Piscis's standard way to assign concrete work to a Koi. It creates a todo, posts the controlled assignment, and requests Koi execution. \
+         - 'add_member': Add a Koi to this project's team (requires pool_id, koi_id). A Koi must be a member before it can be assigned work. \
+         - 'remove_member': Remove a Koi from this project's team (requires pool_id, koi_id). Refused while the Koi still has active todos here. \
+         - 'list_members': List the Koi that are members of this project (requires pool_id). \
+         - 'assign_koi': Piscis's standard way to assign concrete work to a Koi (the Koi must already be a project member — call 'add_member' first). It creates a todo, posts the controlled assignment, and requests Koi execution. \
          - 'pause': Pause a project (freezes task scheduling). \
          - 'resume': Resume a paused or archived project. \
          - 'archive': Archive a project (read-only). \
@@ -131,7 +134,7 @@ impl Tool for PoolOrgTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["create", "read", "update", "list", "assign_koi", "pause", "resume", "archive", "find_related", "get_messages", "get_todos", "post_status", "wait_for_koi", "create_todo", "claim_todo", "complete_todo", "cancel_todo", "resume_todo", "replace_todo", "delete_todo", "update_todo_status", "merge_branches"],
+                    "enum": ["create", "read", "update", "list", "add_member", "remove_member", "list_members", "assign_koi", "pause", "resume", "archive", "find_related", "get_messages", "get_todos", "post_status", "wait_for_koi", "create_todo", "claim_todo", "complete_todo", "cancel_todo", "resume_todo", "replace_todo", "delete_todo", "update_todo_status", "merge_branches"],
                     "description": "Action to perform"
                 },
                 "project_dir": {
@@ -173,7 +176,7 @@ impl Tool for PoolOrgTool {
                 },
                 "koi_id": {
                     "type": "string",
-                    "description": "For assign_koi: the Koi to assign"
+                    "description": "For assign_koi/add_member/remove_member: the Koi to assign or to add/remove from the project (ID or name)"
                 },
                 "task": {
                     "type": "string",
@@ -331,6 +334,29 @@ impl Tool for PoolOrgTool {
                 Ok(v) => Ok(ToolResult::ok(render_list_pools(&v))),
                 Err(e) => Ok(ToolResult::err(e.to_string())),
             },
+            "add_member" => {
+                let pool_id = input["pool_id"].as_str().unwrap_or("");
+                let koi_id = input["koi_id"].as_str().unwrap_or("");
+                match services::add_member(&self.store, &*self.sink, &caller, pool_id, koi_id).await {
+                    Ok(v) => Ok(ToolResult::ok(Self::summary_of(&v))),
+                    Err(e) => Ok(ToolResult::err(e.to_string())),
+                }
+            }
+            "remove_member" => {
+                let pool_id = input["pool_id"].as_str().unwrap_or("");
+                let koi_id = input["koi_id"].as_str().unwrap_or("");
+                match services::remove_member(&self.store, &*self.sink, &caller, pool_id, koi_id).await {
+                    Ok(v) => Ok(ToolResult::ok(Self::summary_of(&v))),
+                    Err(e) => Ok(ToolResult::err(e.to_string())),
+                }
+            }
+            "list_members" => {
+                let pool_id = input["pool_id"].as_str().unwrap_or("");
+                match services::list_members(&self.store, &caller, pool_id).await {
+                    Ok(v) => Ok(ToolResult::ok(render_members(&v))),
+                    Err(e) => Ok(ToolResult::err(e.to_string())),
+                }
+            }
             "assign_koi" => {
                 let args = AssignKoiArgs {
                     pool_id: input["pool_id"].as_str().unwrap_or("").to_string(),
@@ -574,7 +600,7 @@ impl Tool for PoolOrgTool {
                 }
             }
             _ => Ok(ToolResult::err(format!(
-                "Unknown action '{}'. Use: create, read, update, list, assign_koi, pause, resume, archive, find_related, get_messages, get_todos, post_status, wait_for_koi, create_todo, claim_todo, complete_todo, cancel_todo, resume_todo, replace_todo, delete_todo, update_todo_status, merge_branches",
+                "Unknown action '{}'. Use: create, read, update, list, add_member, remove_member, list_members, assign_koi, pause, resume, archive, find_related, get_messages, get_todos, post_status, wait_for_koi, create_todo, claim_todo, complete_todo, cancel_todo, resume_todo, replace_todo, delete_todo, update_todo_status, merge_branches",
                 action
             ))),
         }
@@ -676,6 +702,55 @@ fn render_list_pools(v: &Value) -> String {
         } else {
             koi_summary.join("\n")
         }
+    )
+}
+
+fn render_members(v: &Value) -> String {
+    use piscis_core::models::KoiDefinition;
+    let pool_id = v
+        .get("pool_id")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let members: Vec<KoiDefinition> = v
+        .get("members")
+        .and_then(|m| m.as_array())
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|x| serde_json::from_value(x).ok())
+        .collect();
+
+    if members.is_empty() {
+        return format!(
+            "Project '{}' has no member Koi yet. Use 'add_member' to build the team before assigning work.",
+            short_id(&pool_id)
+        );
+    }
+
+    let lines: Vec<String> = members
+        .iter()
+        .map(|k| {
+            format!(
+                "- {} {} (id: {}) [{}] role: {}",
+                k.icon,
+                k.name,
+                short_id(&k.id),
+                k.status,
+                if k.role.trim().is_empty() {
+                    "unspecified"
+                } else {
+                    &k.role
+                }
+            )
+        })
+        .collect();
+
+    format!(
+        "Project '{}' members ({}):\n{}",
+        short_id(&pool_id),
+        members.len(),
+        lines.join("\n")
     )
 }
 

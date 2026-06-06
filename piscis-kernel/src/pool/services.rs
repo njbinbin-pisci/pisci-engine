@@ -348,6 +348,167 @@ pub async fn list_pools(store: &PoolStore) -> anyhow::Result<Value> {
     }))
 }
 
+// ─── pool membership (project team roster) ──────────────────────────────
+
+/// Reject the operation unless `koi_id` is a member of the pool. Shared
+/// by `assign_koi` and the desktop `create_koi_todo` bridge so a Koi can
+/// only be given work in projects it has explicitly joined.
+async fn ensure_pool_member(
+    store: &PoolStore,
+    pool_id: &str,
+    koi_id: &str,
+) -> anyhow::Result<()> {
+    let pool_id = pool_id.to_string();
+    let koi_id = koi_id.to_string();
+    let is_member = store
+        .read(move |db| db.is_pool_member(&pool_id, &koi_id))
+        .await?;
+    if !is_member {
+        anyhow::bail!(
+            "Koi is not a member of this project. Add it first with pool_org(action=\"add_member\", koi_id=...) before assigning work."
+        );
+    }
+    Ok(())
+}
+
+/// List the members (full Koi definitions) of a pool.
+pub async fn list_members(
+    store: &PoolStore,
+    caller: &CallerContext<'_>,
+    pool_id_hint: &str,
+) -> anyhow::Result<Value> {
+    let session = resolve_pool(store, caller, pool_id_hint, "list_members").await?;
+    let pool_id = session.id.clone();
+    let members = store
+        .read(move |db| db.list_pool_members(&pool_id))
+        .await?;
+    Ok(json!({
+        "pool_id": session.id,
+        "members": members,
+        "summary": format!("Project has {} member Koi.", members.len()),
+    }))
+}
+
+/// Add a Koi to a pool's roster. Validates that the Koi exists and is not
+/// already a member.
+pub async fn add_member(
+    store: &PoolStore,
+    sink: &dyn PoolEventSink,
+    caller: &CallerContext<'_>,
+    pool_id_hint: &str,
+    koi_id: &str,
+) -> anyhow::Result<Value> {
+    let session = resolve_pool(store, caller, pool_id_hint, "add_member").await?;
+    let raw = koi_id.trim().to_string();
+    if raw.is_empty() {
+        anyhow::bail!("'koi_id' is required for action 'add_member'");
+    }
+
+    let pool_id = session.id.clone();
+    let (koi, already) = store
+        .read({
+            let lookup = raw.clone();
+            let pid = pool_id.clone();
+            move |db| {
+                let koi = db.resolve_koi_identifier(&lookup)?;
+                let already = match &koi {
+                    Some(k) => db.is_pool_member(&pid, &k.id)?,
+                    None => false,
+                };
+                Ok((koi, already))
+            }
+        })
+        .await?;
+    let koi = koi.ok_or_else(|| {
+        anyhow::anyhow!("Koi '{}' was not found. Create it first.", raw)
+    })?;
+    if already {
+        anyhow::bail!("Koi '{}' is already a member of this project.", koi.name);
+    }
+
+    let koi_id_owned = koi.id.clone();
+    let pid = pool_id.clone();
+    store
+        .write(move |db| db.add_pool_member(&pid, &koi_id_owned))
+        .await?;
+
+    emit_pool_membership_changed(store, sink, &session.id).await;
+
+    Ok(json!({
+        "pool_id": session.id,
+        "koi_id": koi.id,
+        "koi_name": koi.name,
+        "summary": format!("{} added to the project.", koi.name),
+    }))
+}
+
+/// Remove a Koi from a pool's roster. Refuses if the Koi still owns
+/// active (not done/cancelled) todos in this pool.
+pub async fn remove_member(
+    store: &PoolStore,
+    sink: &dyn PoolEventSink,
+    caller: &CallerContext<'_>,
+    pool_id_hint: &str,
+    koi_id: &str,
+) -> anyhow::Result<Value> {
+    let session = resolve_pool(store, caller, pool_id_hint, "remove_member").await?;
+    let raw = koi_id.trim().to_string();
+    if raw.is_empty() {
+        anyhow::bail!("'koi_id' is required for action 'remove_member'");
+    }
+
+    let pool_id = session.id.clone();
+    let (koi, active) = store
+        .read({
+            let lookup = raw.clone();
+            let pid = pool_id.clone();
+            move |db| {
+                let koi = db.resolve_koi_identifier(&lookup)?;
+                let active = match &koi {
+                    Some(k) => db.count_active_todos_for_member(&pid, &k.id)?,
+                    None => 0,
+                };
+                Ok((koi, active))
+            }
+        })
+        .await?;
+    let koi = koi
+        .ok_or_else(|| anyhow::anyhow!("Koi '{}' was not found.", raw))?;
+    if active > 0 {
+        anyhow::bail!(
+            "Cannot remove {}: it still has {} active todo(s) in this project. Reassign or finish them first.",
+            koi.name,
+            active
+        );
+    }
+
+    let koi_id_owned = koi.id.clone();
+    let pid = pool_id.clone();
+    store
+        .write(move |db| db.remove_pool_member(&pid, &koi_id_owned))
+        .await?;
+
+    emit_pool_membership_changed(store, sink, &session.id).await;
+
+    Ok(json!({
+        "pool_id": session.id,
+        "koi_id": koi.id,
+        "koi_name": koi.name,
+        "summary": format!("{} removed from the project.", koi.name),
+    }))
+}
+
+/// Re-read the pool (with hydrated `member_koi_ids`) and emit a
+/// `PoolUpdated` event so subscribers refresh their participant list.
+async fn emit_pool_membership_changed(store: &PoolStore, sink: &dyn PoolEventSink, pool_id: &str) {
+    let pid = pool_id.to_string();
+    if let Ok(Some(session)) = store.read(move |db| db.get_pool_session(&pid)).await {
+        sink.emit_pool(&PoolEvent::PoolUpdated {
+            pool: (&session).into(),
+        });
+    }
+}
+
 pub async fn find_related(store: &PoolStore, keywords: &str) -> anyhow::Result<Value> {
     let k = keywords.trim();
     if k.is_empty() {
@@ -881,6 +1042,9 @@ pub async fn assign_koi(
             }
         }
     };
+
+    // A Koi can only be given work in a project it has joined.
+    ensure_pool_member(store, &session.id, &koi_id).await?;
 
     let mention = if args.timeout_secs > 0 {
         format!(

@@ -1,6 +1,6 @@
 [package]
 name = "piscis-cli"
-version = "0.8.38"
+version = "0.8.41"
 edition = "2021"
 description = "OpenPiscis headless CLI - cross-platform agent runner with no Tauri / GUI dependency."
 

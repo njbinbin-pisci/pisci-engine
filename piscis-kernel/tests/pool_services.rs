@@ -379,6 +379,10 @@ async fn assign_koi_creates_todo_posts_mention_and_emits_events() {
     let pool_id = create_test_pool(&store, &sink).await;
 
     let caller = piscis_caller("sess-1");
+    // assign_koi now requires the Koi to be a project member first.
+    services::add_member(&store, sink.as_ref(), &caller, &pool_id, "koi-alpha")
+        .await
+        .expect("add_member");
     let subagent = Arc::new(StubSubagentRuntime::always_complete("ok"))
         as Arc<dyn piscis_core::host::SubagentRuntime>;
     let cfg = CoordinatorConfig::default();
@@ -795,4 +799,192 @@ async fn delete_todo_can_batch_delete_cancelled_items_in_pool() {
         .expect("remaining todos");
     assert_eq!(todos.len(), 1);
     assert_eq!(todos[0].title, "keep me");
+}
+
+// ─── pool membership ────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn add_list_remove_member_round_trip() {
+    let store = build_store();
+    let sink = make_sink();
+    let pool_id = create_test_pool(&store, &sink).await;
+    let caller = piscis_caller("sess-1");
+
+    // Fresh pool starts with no members.
+    let listed = services::list_members(&store, &caller, &pool_id)
+        .await
+        .expect("list_members");
+    assert_eq!(listed["members"].as_array().unwrap().len(), 0);
+
+    services::add_member(&store, sink.as_ref(), &caller, &pool_id, "koi-alpha")
+        .await
+        .expect("add alpha");
+    services::add_member(&store, sink.as_ref(), &caller, &pool_id, "koi-beta")
+        .await
+        .expect("add beta");
+
+    let listed = services::list_members(&store, &caller, &pool_id)
+        .await
+        .expect("list_members");
+    assert_eq!(listed["members"].as_array().unwrap().len(), 2);
+
+    // Adding a member emits PoolUpdated so the UI can refresh participants.
+    assert!(
+        sink.drain_kinds().contains(&"pool_updated"),
+        "add_member must emit PoolUpdated"
+    );
+
+    services::remove_member(&store, sink.as_ref(), &caller, &pool_id, "koi-beta")
+        .await
+        .expect("remove beta");
+    let listed = services::list_members(&store, &caller, &pool_id)
+        .await
+        .expect("list_members");
+    let names: Vec<&str> = listed["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["koi-alpha"]);
+}
+
+#[tokio::test]
+async fn add_member_rejects_duplicate() {
+    let store = build_store();
+    let sink = make_sink();
+    let pool_id = create_test_pool(&store, &sink).await;
+    let caller = piscis_caller("sess-1");
+
+    services::add_member(&store, sink.as_ref(), &caller, &pool_id, "koi-alpha")
+        .await
+        .expect("add alpha");
+    let err = services::add_member(&store, sink.as_ref(), &caller, &pool_id, "koi-alpha")
+        .await
+        .expect_err("duplicate add must fail");
+    assert!(
+        err.to_string().contains("already a member"),
+        "unexpected duplicate error: {}",
+        err
+    );
+}
+
+#[tokio::test]
+async fn assign_koi_rejects_non_member() {
+    let store = build_store();
+    let sink = make_sink();
+    let pool_id = create_test_pool(&store, &sink).await;
+    let caller = piscis_caller("sess-1");
+    let cfg = CoordinatorConfig::default();
+
+    let err = services::assign_koi(
+        &store,
+        sink_arc(&sink),
+        None,
+        &cfg,
+        &caller,
+        AssignKoiArgs {
+            pool_id: pool_id.clone(),
+            koi_id: "koi-alpha".into(),
+            task: "do work without joining".into(),
+            priority: "medium".into(),
+            timeout_secs: 0,
+            context: None,
+            depends_on: None,
+        },
+    )
+    .await
+    .expect_err("assign_koi must reject a non-member Koi");
+    assert!(
+        err.to_string().contains("not a member"),
+        "unexpected non-member error: {}",
+        err
+    );
+
+    // No todo should have been created for the rejected assignment.
+    let todos = store
+        .read(|db| db.list_koi_todos(Some("koi-alpha")))
+        .await
+        .expect("list todos");
+    assert!(todos.is_empty(), "rejected assign_koi must not create a todo");
+}
+
+#[tokio::test]
+async fn remove_member_blocked_while_active_todo_exists() {
+    let store = build_store();
+    let sink = make_sink();
+    let pool_id = create_test_pool(&store, &sink).await;
+    let caller = piscis_caller("sess-1");
+
+    services::add_member(&store, sink.as_ref(), &caller, &pool_id, "koi-alpha")
+        .await
+        .expect("add alpha");
+
+    // Give Alpha an active todo in the pool.
+    let pid = pool_id.clone();
+    store
+        .write(move |db| {
+            db.create_koi_todo(
+                "koi-alpha",
+                "live work",
+                "",
+                "medium",
+                "piscis",
+                Some(&pid),
+                "koi",
+                None,
+                0,
+            )
+        })
+        .await
+        .expect("seed active todo");
+
+    let err = services::remove_member(&store, sink.as_ref(), &caller, &pool_id, "koi-alpha")
+        .await
+        .expect_err("remove must fail with active todos");
+    assert!(
+        err.to_string().contains("active todo"),
+        "unexpected remove error: {}",
+        err
+    );
+}
+
+#[tokio::test]
+async fn backfill_seeds_members_from_existing_todos() {
+    let store = build_store();
+    let sink = make_sink();
+    let pool_id = create_test_pool(&store, &sink).await;
+
+    // Simulate a legacy pool: Alpha already owns a todo but was never
+    // explicitly added as a member.
+    let pid = pool_id.clone();
+    store
+        .write(move |db| {
+            db.create_koi_todo(
+                "koi-alpha",
+                "legacy task",
+                "",
+                "medium",
+                "piscis",
+                Some(&pid),
+                "koi",
+                None,
+                0,
+            )
+        })
+        .await
+        .expect("seed legacy todo");
+
+    // Run the one-shot backfill explicitly (startup runs it once).
+    store
+        .write(|db| db.backfill_pool_members_from_todos())
+        .await
+        .expect("backfill");
+
+    let pid = pool_id.clone();
+    let member_ids = store
+        .read(move |db| db.list_pool_member_ids(&pid))
+        .await
+        .expect("member ids");
+    assert_eq!(member_ids, vec!["koi-alpha".to_string()]);
 }

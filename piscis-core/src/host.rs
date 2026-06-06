@@ -422,6 +422,11 @@ pub struct PoolSessionSnapshot {
     pub project_dir: Option<String>,
     #[serde(default)]
     pub task_timeout_secs: u32,
+    /// Ids of the Koi that are members of this pool. Lets the UI render
+    /// participants and assignment targets from the event payload without
+    /// a follow-up round-trip.
+    #[serde(default)]
+    pub member_koi_ids: Vec<String>,
 }
 
 impl From<&crate::models::PoolSession> for PoolSessionSnapshot {
@@ -432,6 +437,7 @@ impl From<&crate::models::PoolSession> for PoolSessionSnapshot {
             status: p.status.clone(),
             project_dir: p.project_dir.clone(),
             task_timeout_secs: p.task_timeout_secs,
+            member_koi_ids: p.member_koi_ids.clone(),
         }
     }
 }

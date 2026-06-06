@@ -751,6 +751,47 @@ impl Database {
             [],
         );
 
+        // Tiny key/value table for one-shot migration guards and similar
+        // bookkeeping that must persist across restarts.
+        let _ = self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS app_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            ",
+        );
+
+        // Pool membership — explicit project team roster. A Koi must be a
+        // member of a pool before it can be assigned work there. Previously
+        // the UI treated *every* Koi as a participant of *every* pool; this
+        // table makes membership an explicit, per-project relationship.
+        let _ = self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS pool_members (
+                pool_session_id TEXT NOT NULL,
+                koi_id TEXT NOT NULL,
+                joined_at TEXT NOT NULL,
+                PRIMARY KEY (pool_session_id, koi_id),
+                FOREIGN KEY (pool_session_id) REFERENCES pool_sessions(id) ON DELETE CASCADE,
+                FOREIGN KEY (koi_id) REFERENCES kois(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_pool_members_pool ON pool_members(pool_session_id);
+            CREATE INDEX IF NOT EXISTS idx_pool_members_koi ON pool_members(koi_id);
+            ",
+        );
+        // One-time backfill: pre-existing pools have no explicit roster, so
+        // derive their initial membership from the distinct Koi owners that
+        // already have todos in the pool. Pools without any historical Koi
+        // todo start empty — the user adds members via the UI. We do NOT
+        // default to "all Kois" anymore. Guarded by a meta flag so it runs
+        // exactly once even though this migration block executes on every
+        // startup.
+        if !self.meta_flag_is_set("pool_members_backfilled") {
+            let _ = self.backfill_pool_members_from_todos();
+            let _ = self.set_meta_flag("pool_members_backfilled");
+        }
+
         // Phase 0 — scheduled tasks can opt into multi-target delivery
         // (UI + IM bindings + IM sessions). Stored as JSON so the
         // shape evolves without further migrations.
@@ -3365,6 +3406,7 @@ impl Database {
             project_dir: project_dir.map(String::from),
             task_timeout_secs,
             origin_im_binding_key: None,
+            member_koi_ids: Vec::new(),
             last_active_at: Some(now),
             created_at: now,
             updated_at: now,
@@ -3382,6 +3424,8 @@ impl Database {
             project_dir: r.get::<_, Option<String>>(4)?,
             task_timeout_secs: r.get::<_, u32>(5).unwrap_or(0),
             origin_im_binding_key: r.get::<_, Option<String>>(6).ok().flatten(),
+            // Hydrated separately by list/get callers; see hydrate_members.
+            member_koi_ids: Vec::new(),
             last_active_at: r
                 .get::<_, Option<String>>(7)?
                 .and_then(|s| s.parse::<DateTime<Utc>>().ok()),
@@ -3396,14 +3440,26 @@ impl Database {
         })
     }
 
+    /// Fill in `member_koi_ids` for a freshly-mapped pool session.
+    fn hydrate_members(
+        &self,
+        mut session: piscis_core::models::PoolSession,
+    ) -> Result<piscis_core::models::PoolSession> {
+        session.member_koi_ids = self.list_pool_member_ids(&session.id)?;
+        Ok(session)
+    }
+
     pub fn list_pool_sessions(&self) -> Result<Vec<piscis_core::models::PoolSession>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, org_spec, status, project_dir, task_timeout_secs, origin_im_binding_key, last_active_at, created_at, updated_at \
              FROM pool_sessions ORDER BY updated_at DESC"
         )?;
         let rows = stmt.query_map([], Self::map_pool_session)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+        let sessions = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        sessions
+            .into_iter()
+            .map(|s| self.hydrate_members(s))
+            .collect()
     }
 
     pub fn get_pool_session(&self, id: &str) -> Result<Option<piscis_core::models::PoolSession>> {
@@ -3412,7 +3468,10 @@ impl Database {
              FROM pool_sessions WHERE id = ?1"
         )?;
         let mut rows = stmt.query_map(params![id], Self::map_pool_session)?;
-        Ok(rows.next().transpose()?)
+        match rows.next().transpose()? {
+            Some(session) => Ok(Some(self.hydrate_members(session)?)),
+            None => Ok(None),
+        }
     }
 
     pub fn get_pool_session_by_prefix(
@@ -3434,7 +3493,7 @@ impl Database {
         let matches = rows.collect::<rusqlite::Result<Vec<_>>>()?;
         match matches.len() {
             0 => Ok(None),
-            1 => Ok(matches.into_iter().next()),
+            1 => Ok(Some(self.hydrate_members(matches.into_iter().next().unwrap())?)),
             _ => Err(anyhow::anyhow!("Pool id prefix '{}' is ambiguous", prefix)),
         }
     }
@@ -3692,6 +3751,139 @@ impl Database {
         self.conn
             .execute("DELETE FROM pool_sessions WHERE id = ?1", params![id])?;
         Ok(())
+    }
+
+    // ─── app_meta (one-shot migration guards) ──────────────────────────
+
+    /// True if the given meta flag has been set previously.
+    pub fn meta_flag_is_set(&self, key: &str) -> bool {
+        self.conn
+            .query_row(
+                "SELECT 1 FROM app_meta WHERE key = ?1",
+                params![key],
+                |_| Ok(()),
+            )
+            .is_ok()
+    }
+
+    /// Persist a meta flag so a one-time migration does not run again.
+    pub fn set_meta_flag(&self, key: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO app_meta (key, value) VALUES (?1, '1')",
+            params![key],
+        )?;
+        Ok(())
+    }
+
+    // ─── pool membership (project team roster) ─────────────────────────
+
+    /// One-shot backfill: seed each pool's roster from the distinct Koi
+    /// owners that already have todos in it. Idempotent via the table's
+    /// primary key. Pools without historical Koi todos stay empty.
+    pub fn backfill_pool_members_from_todos(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "
+            INSERT OR IGNORE INTO pool_members (pool_session_id, koi_id, joined_at)
+            SELECT DISTINCT t.pool_session_id, t.owner_id,
+                   strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            FROM koi_todos t
+            WHERE t.pool_session_id IS NOT NULL
+              AND t.owner_id IN (SELECT id FROM kois);
+            ",
+        )?;
+        Ok(())
+    }
+
+    /// Ids of all Koi that are members of the given pool.
+    pub fn list_pool_member_ids(&self, pool_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT koi_id FROM pool_members WHERE pool_session_id = ?1 ORDER BY joined_at ASC",
+        )?;
+        let rows = stmt.query_map(params![pool_id], |r| r.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Full Koi definitions for every member of the given pool, joined
+    /// against the `kois` table and ordered by join time.
+    pub fn list_pool_members(
+        &self,
+        pool_id: &str,
+    ) -> Result<Vec<piscis_core::models::KoiDefinition>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT k.id, k.name, k.role, k.icon, k.color, k.system_prompt, k.description, k.status, \
+                    k.created_at, k.updated_at, k.llm_provider_id, k.max_iterations, k.task_timeout_secs \
+             FROM pool_members m JOIN kois k ON k.id = m.koi_id \
+             WHERE m.pool_session_id = ?1 ORDER BY m.joined_at ASC",
+        )?;
+        let rows = stmt.query_map(params![pool_id], |r| {
+            Ok(piscis_core::models::KoiDefinition {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                role: r.get::<_, String>(2).unwrap_or_default(),
+                icon: r.get(3)?,
+                color: r.get(4)?,
+                system_prompt: r.get(5)?,
+                description: r.get(6)?,
+                status: r.get(7)?,
+                created_at: r
+                    .get::<_, String>(8)?
+                    .parse::<DateTime<Utc>>()
+                    .unwrap_or_else(|_| Utc::now()),
+                updated_at: r
+                    .get::<_, String>(9)?
+                    .parse::<DateTime<Utc>>()
+                    .unwrap_or_else(|_| Utc::now()),
+                llm_provider_id: r.get(10)?,
+                max_iterations: r.get::<_, u32>(11).unwrap_or(0),
+                task_timeout_secs: r.get::<_, u32>(12).unwrap_or(0),
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// True if the Koi is a member of the given pool.
+    pub fn is_pool_member(&self, pool_id: &str, koi_id: &str) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pool_members WHERE pool_session_id = ?1 AND koi_id = ?2",
+            params![pool_id, koi_id],
+            |r| r.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Add a Koi to a pool's roster (idempotent).
+    pub fn add_pool_member(&self, pool_id: &str, koi_id: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT OR IGNORE INTO pool_members (pool_session_id, koi_id, joined_at) \
+             VALUES (?1, ?2, ?3)",
+            params![pool_id, koi_id, now],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a Koi from a pool's roster.
+    pub fn remove_pool_member(&self, pool_id: &str, koi_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM pool_members WHERE pool_session_id = ?1 AND koi_id = ?2",
+            params![pool_id, koi_id],
+        )?;
+        Ok(())
+    }
+
+    /// Count active (not done/cancelled) todos a member owns in a pool —
+    /// used to block removal of a Koi that still has live work.
+    pub fn count_active_todos_for_member(&self, pool_id: &str, koi_id: &str) -> Result<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM koi_todos \
+             WHERE pool_session_id = ?1 AND owner_id = ?2 \
+               AND status NOT IN ('done', 'cancelled')",
+            params![pool_id, koi_id],
+            |r| r.get(0),
+        )?;
+        Ok(count as usize)
     }
 
     fn internal_session_ids_for_pool(&self, pool_id: &str) -> Result<Vec<String>> {
