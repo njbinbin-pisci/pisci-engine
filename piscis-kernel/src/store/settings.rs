@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 pub struct McpServerConfig {
     /// Display name for this server
     pub name: String,
-    /// "stdio" or "sse"
+    /// "stdio" | "sse" | "http" (streamable HTTP)
     pub transport: String,
     /// For stdio: the executable command
     #[serde(default)]
@@ -23,12 +23,18 @@ pub struct McpServerConfig {
     /// For stdio: command arguments
     #[serde(default)]
     pub args: Vec<String>,
-    /// For sse: the HTTP base URL (e.g. "http://localhost:3000")
+    /// For sse: the HTTP base URL (e.g. "http://localhost:3000").
+    /// For http (streamable HTTP): the single JSON-RPC endpoint URL.
     #[serde(default)]
     pub url: String,
     /// Extra environment variables for stdio processes
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// For sse / http transports: extra HTTP headers sent on every request
+    /// (e.g. `Authorization: Bearer <token>`). Enables authenticated remote
+    /// MCP servers / connectors without leaking the token into `env`.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
     /// Whether this server is enabled
     #[serde(default = "mcp_default_true")]
     pub enabled: bool,
