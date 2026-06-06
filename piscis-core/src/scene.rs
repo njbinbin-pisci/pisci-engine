@@ -3,6 +3,8 @@ pub enum SceneKind {
     MainChat,
     PoolCoordinator,
     KoiTask,
+    /// Main-chat persona mode: Piscis speaks as a Koi directly to the user (no pool tools).
+    KoiPersona,
     IMHeadless,
     HeartbeatSupervisor,
 }
@@ -12,6 +14,7 @@ pub enum RegistryProfile {
     MainChat,
     PoolCoordinator,
     KoiTask,
+    KoiPersona,
     IMHeadless,
     HeartbeatSupervisor,
 }
@@ -87,6 +90,26 @@ const KOI_TASK_TOOLS: &[&str] = &[
     "call_koi",
     "pool_org",
     "pool_chat",
+    "vision_context",
+    "skill_list",
+    "ssh",
+    "pdf",
+];
+
+/// Koi domain tools for main-chat persona mode (no pool collaboration primitives).
+const KOI_PERSONA_TOOLS: &[&str] = &[
+    "file_read",
+    "file_write",
+    "file_edit",
+    "file_diff",
+    "code_run",
+    "file_search",
+    "file_list",
+    "shell",
+    "web_search",
+    "browser",
+    "memory_store",
+    "call_fish",
     "vision_context",
     "skill_list",
     "ssh",
@@ -187,6 +210,19 @@ impl ScenePolicy {
                 injection_budget_min_chars: 1_500,
                 auto_compact_threshold_override: Some(0),
             },
+            SceneKind::KoiPersona => Self {
+                registry_profile: RegistryProfile::KoiPersona,
+                allow_skill_loader: true,
+                allow_mcp_tools: true,
+                include_memory: true,
+                include_task_state: false,
+                include_pool_roster: false,
+                include_pool_context: false,
+                include_project_instructions: true,
+                injection_budget_ratio: 0.12,
+                injection_budget_min_chars: 1_800,
+                auto_compact_threshold_override: None,
+            },
             // IMHeadless: an agent session triggered by an inbound IM
             // message. Per the layered architecture (credentials shared,
             // usage independent), the IM channel only carries transport;
@@ -243,7 +279,9 @@ impl ScenePolicy {
 
     pub fn collaboration_context_mode(self) -> CollaborationContextMode {
         match self.registry_profile {
-            RegistryProfile::MainChat => CollaborationContextMode::OnDemand,
+            RegistryProfile::MainChat | RegistryProfile::KoiPersona => {
+                CollaborationContextMode::OnDemand
+            }
             RegistryProfile::IMHeadless => CollaborationContextMode::Never,
             RegistryProfile::PoolCoordinator
             | RegistryProfile::KoiTask
@@ -256,6 +294,7 @@ impl ScenePolicy {
             RegistryProfile::MainChat | RegistryProfile::IMHeadless => None,
             RegistryProfile::PoolCoordinator => Some(POOL_COORDINATOR_TOOLS),
             RegistryProfile::KoiTask => Some(KOI_TASK_TOOLS),
+            RegistryProfile::KoiPersona => Some(KOI_PERSONA_TOOLS),
             RegistryProfile::HeartbeatSupervisor => Some(HEARTBEAT_SUPERVISOR_TOOLS),
         }
     }
@@ -266,13 +305,15 @@ impl ScenePolicy {
             RegistryProfile::PoolCoordinator | RegistryProfile::HeartbeatSupervisor => {
                 HistorySliceMode::SummaryOnly
             }
-            RegistryProfile::KoiTask => HistorySliceMode::None,
+            RegistryProfile::KoiTask | RegistryProfile::KoiPersona => HistorySliceMode::None,
         }
     }
 
     pub fn event_digest_mode(self) -> EventDigestMode {
         match self.registry_profile {
-            RegistryProfile::MainChat | RegistryProfile::IMHeadless => EventDigestMode::Off,
+            RegistryProfile::MainChat
+            | RegistryProfile::IMHeadless
+            | RegistryProfile::KoiPersona => EventDigestMode::Off,
             RegistryProfile::PoolCoordinator => EventDigestMode::CoordinationPlusFailures,
             RegistryProfile::KoiTask => EventDigestMode::CoordinationPlusFailures,
             RegistryProfile::HeartbeatSupervisor => EventDigestMode::CoordinationPlusFailures,
@@ -284,7 +325,9 @@ impl ScenePolicy {
             return MemorySliceMode::Off;
         }
         match self.registry_profile {
-            RegistryProfile::KoiTask => MemorySliceMode::ScopedPlusRecent,
+            RegistryProfile::KoiTask | RegistryProfile::KoiPersona => {
+                MemorySliceMode::ScopedPlusRecent
+            }
             RegistryProfile::MainChat
             | RegistryProfile::PoolCoordinator
             | RegistryProfile::IMHeadless
@@ -298,7 +341,7 @@ impl ScenePolicy {
             RegistryProfile::KoiTask
             | RegistryProfile::PoolCoordinator
             | RegistryProfile::HeartbeatSupervisor => PoolSnapshotMode::Compact,
-            RegistryProfile::MainChat => PoolSnapshotMode::Full,
+            RegistryProfile::MainChat | RegistryProfile::KoiPersona => PoolSnapshotMode::Full,
         }
     }
 
@@ -307,6 +350,7 @@ impl ScenePolicy {
             RegistryProfile::MainChat => 8,
             RegistryProfile::PoolCoordinator => 10,
             RegistryProfile::KoiTask => 12,
+            RegistryProfile::KoiPersona => 0,
             RegistryProfile::IMHeadless => 0,
             RegistryProfile::HeartbeatSupervisor => 6,
         }
@@ -317,6 +361,7 @@ impl ScenePolicy {
             RegistryProfile::MainChat => 180,
             RegistryProfile::PoolCoordinator => 220,
             RegistryProfile::KoiTask => 260,
+            RegistryProfile::KoiPersona => 0,
             RegistryProfile::IMHeadless => 0,
             RegistryProfile::HeartbeatSupervisor => 180,
         }
@@ -327,6 +372,7 @@ impl ScenePolicy {
             RegistryProfile::MainChat => 600,
             RegistryProfile::PoolCoordinator => 900,
             RegistryProfile::KoiTask => 1_200,
+            RegistryProfile::KoiPersona => 0,
             RegistryProfile::IMHeadless => 0,
             RegistryProfile::HeartbeatSupervisor => 600,
         }

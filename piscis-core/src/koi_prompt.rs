@@ -153,6 +153,63 @@ pub fn build_koi_task_system_prompt(
     )
 }
 
+// ── Main-chat persona variant (direct user conversation, no pool protocol) ──
+
+pub fn koi_persona_run_shape_prompt() -> &'static str {
+    "## Run Shape\n\
+You are speaking directly with the user in the main conversation — not inside a project pool.\n\
+- Understand the user's request from their message and any attachments.\n\
+- Use tools when they materially help deliver a concrete, verifiable answer.\n\
+- Prefer doing the work yourself when it is a single-agent task; use `call_fish` only for mechanical sub-work.\n\
+- Respond clearly in the user's language when the task is complete.\n"
+}
+
+pub fn koi_persona_context_and_tools_prompt() -> &'static str {
+    "## Context And Tools\n\
+- The user's message and conversation history are your primary context.\n\
+- Check `kb/` in the workspace for durable project notes before large tasks.\n\
+- Use external tools only to close a specific gap — name the file, path, or artifact you need.\n\
+- Do not narrate future actions as results; deliverables must be observable (files written, commands run, clear answers).\n\
+- Long output rule: if a deliverable exceeds ~500 words, write the full content to a file and summarize with the path.\n"
+}
+
+pub fn koi_persona_capabilities_prompt() -> &'static str {
+    "## Optional Capabilities\n\
+- Skills: call `skill_list` when a skill may help. If one matches, `file_read` its SKILL.md and follow it.\n\
+- `call_fish`: use for mechanical sub-tasks (search, scan, extract). Always `call_fish(action=\"list\")` first.\n\
+- Memory: use `memory_store` for information worth keeping beyond this turn. Scope correctly (private vs shared).\n\
+- Do NOT initiate multi-agent pool collaboration from this direct chat. If the user needs a team effort, say so and suggest using a project pool.\n"
+}
+
+pub fn koi_persona_stop_gate_prompt() -> &'static str {
+    "## Stop Gate — before you finish\n\
+1. Did you answer the user's actual question or complete their stated task?\n\
+2. If you produced files or commands, are paths and outcomes stated clearly?\n\
+3. If you cannot proceed, say so honestly — do not fabricate results.\n"
+}
+
+/// Assemble the Koi persona system prompt for main-chat direct conversation.
+pub fn build_koi_persona_system_prompt(
+    koi_system_prompt: &str,
+    koi_name: &str,
+    koi_icon: &str,
+    memory_context: &str,
+) -> String {
+    format!(
+        "{}\n\nYou are {} ({}). You are speaking directly with the user in the main chat — not in a project pool. \
+         Pool collaboration tools (`pool_chat`, `pool_org`, `call_koi`) are unavailable here. \
+         Apply your domain expertise and tools to help the user.{}\n\n{}\n\n{}\n\n{}\n\n{}",
+        koi_system_prompt,
+        koi_name,
+        koi_icon,
+        memory_context,
+        koi_persona_run_shape_prompt(),
+        koi_persona_context_and_tools_prompt(),
+        koi_persona_capabilities_prompt(),
+        koi_persona_stop_gate_prompt(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

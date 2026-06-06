@@ -12,7 +12,7 @@
 //!   are first-class, so hosts can build journaling, auditing, policy plugins,
 //!   undo/replay, telemetry, etc. on top of the same surface.
 //!
-//! The first consumer is CodeZ's file journal, which snapshots file contents
+//! The first consumer is AgentZ's file journal, which snapshots file contents
 //! before `file_write` / `file_edit` so the host can offer Cursor-style
 //! "Undo All" / replay recovery.
 

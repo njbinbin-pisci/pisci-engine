@@ -3493,7 +3493,9 @@ impl Database {
         let matches = rows.collect::<rusqlite::Result<Vec<_>>>()?;
         match matches.len() {
             0 => Ok(None),
-            1 => Ok(Some(self.hydrate_members(matches.into_iter().next().unwrap())?)),
+            1 => Ok(Some(
+                self.hydrate_members(matches.into_iter().next().unwrap())?,
+            )),
             _ => Err(anyhow::anyhow!("Pool id prefix '{}' is ambiguous", prefix)),
         }
     }

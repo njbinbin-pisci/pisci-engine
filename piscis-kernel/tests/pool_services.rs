@@ -906,7 +906,10 @@ async fn assign_koi_rejects_non_member() {
         .read(|db| db.list_koi_todos(Some("koi-alpha")))
         .await
         .expect("list todos");
-    assert!(todos.is_empty(), "rejected assign_koi must not create a todo");
+    assert!(
+        todos.is_empty(),
+        "rejected assign_koi must not create a todo"
+    );
 }
 
 #[tokio::test]

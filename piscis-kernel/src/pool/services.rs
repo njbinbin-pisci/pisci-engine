@@ -353,11 +353,7 @@ pub async fn list_pools(store: &PoolStore) -> anyhow::Result<Value> {
 /// Reject the operation unless `koi_id` is a member of the pool. Shared
 /// by `assign_koi` and the desktop `create_koi_todo` bridge so a Koi can
 /// only be given work in projects it has explicitly joined.
-async fn ensure_pool_member(
-    store: &PoolStore,
-    pool_id: &str,
-    koi_id: &str,
-) -> anyhow::Result<()> {
+async fn ensure_pool_member(store: &PoolStore, pool_id: &str, koi_id: &str) -> anyhow::Result<()> {
     let pool_id = pool_id.to_string();
     let koi_id = koi_id.to_string();
     let is_member = store
@@ -379,9 +375,7 @@ pub async fn list_members(
 ) -> anyhow::Result<Value> {
     let session = resolve_pool(store, caller, pool_id_hint, "list_members").await?;
     let pool_id = session.id.clone();
-    let members = store
-        .read(move |db| db.list_pool_members(&pool_id))
-        .await?;
+    let members = store.read(move |db| db.list_pool_members(&pool_id)).await?;
     Ok(json!({
         "pool_id": session.id,
         "members": members,
@@ -419,9 +413,8 @@ pub async fn add_member(
             }
         })
         .await?;
-    let koi = koi.ok_or_else(|| {
-        anyhow::anyhow!("Koi '{}' was not found. Create it first.", raw)
-    })?;
+    let koi =
+        koi.ok_or_else(|| anyhow::anyhow!("Koi '{}' was not found. Create it first.", raw))?;
     if already {
         anyhow::bail!("Koi '{}' is already a member of this project.", koi.name);
     }
@@ -472,8 +465,7 @@ pub async fn remove_member(
             }
         })
         .await?;
-    let koi = koi
-        .ok_or_else(|| anyhow::anyhow!("Koi '{}' was not found.", raw))?;
+    let koi = koi.ok_or_else(|| anyhow::anyhow!("Koi '{}' was not found.", raw))?;
     if active > 0 {
         anyhow::bail!(
             "Cannot remove {}: it still has {} active todo(s) in this project. Reassign or finish them first.",

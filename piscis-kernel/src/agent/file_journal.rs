@@ -6,12 +6,12 @@
 //! dropped on failure). A turn's snapshots can then be reverted ("Undo All").
 //!
 //! Message-level checkpoints alone cannot recover code — only a content
-//! journal can. Both desktop hosts (CodeZ, openpiscis) share this exact
+//! journal can. Both desktop hosts (AgentZ, openpiscis) share this exact
 //! implementation and add only a thin command/UI layer, so the capability
 //! never forks between products.
 //!
 //! Storage is a standalone DB (path chosen by the host, e.g.
-//! `{project}/.codez/journal.db`) kept separate from the chat DB so journaling
+//! `{project}/.agentz/journal.db`) kept separate from the chat DB so journaling
 //! never contends with the kernel's own locking inside the agent loop.
 
 use std::path::{Path, PathBuf};

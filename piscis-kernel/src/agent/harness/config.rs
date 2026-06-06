@@ -202,7 +202,7 @@ pub struct HarnessConfig {
     /// `None` means "reuse the main model".
     pub summary_model: Option<String>,
     /// Optional host lifecycle hooks (tool before/after, context events).
-    /// Wired by hosts that observe the loop (e.g. CodeZ's file journal).
+    /// Wired by hosts that observe the loop (e.g. AgentZ's file journal).
     pub hooks: Option<Arc<dyn crate::agent::hooks::AgentHooks>>,
     /// Optional pluggable compaction policy. `None` uses the kernel's built-in
     /// [`crate::agent::loop_::DefaultCompaction`].

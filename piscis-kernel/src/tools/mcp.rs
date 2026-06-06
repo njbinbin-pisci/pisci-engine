@@ -123,7 +123,10 @@ impl StdioTransport {
 
 /// Apply caller-configured HTTP headers (e.g. `Authorization: Bearer …`) from
 /// `McpServerConfig::headers` onto an outgoing request.
-fn apply_headers(mut req: reqwest::RequestBuilder, headers: &HashMap<String, String>) -> reqwest::RequestBuilder {
+fn apply_headers(
+    mut req: reqwest::RequestBuilder,
+    headers: &HashMap<String, String>,
+) -> reqwest::RequestBuilder {
     for (k, v) in headers {
         if !k.is_empty() {
             req = req.header(k.as_str(), v.as_str());
@@ -278,7 +281,10 @@ impl StreamableHttpTransport {
 /// JSON object and an SSE `text/event-stream` payload (returning the first
 /// `data:` frame that carries a JSON-RPC `result`/`error`).
 fn parse_jsonrpc_body(content_type: &str, body: &str) -> Result<Value> {
-    let looks_sse = content_type.contains("text/event-stream") || body.trim_start().starts_with("event:") || body.contains("\ndata:") || body.starts_with("data:");
+    let looks_sse = content_type.contains("text/event-stream")
+        || body.trim_start().starts_with("event:")
+        || body.contains("\ndata:")
+        || body.starts_with("data:");
     if looks_sse {
         let mut last: Option<Value> = None;
         for line in body.lines() {
@@ -389,7 +395,8 @@ impl McpClient {
                 Transport::Sse(t)
             }
             "http" | "streamable-http" | "streamable_http" => {
-                let mut t = StreamableHttpTransport::new(&self.config.url, self.config.headers.clone());
+                let mut t =
+                    StreamableHttpTransport::new(&self.config.url, self.config.headers.clone());
                 // Initialize handshake (also captures the Mcp-Session-Id header).
                 let init_req = make_request(
                     "initialize",

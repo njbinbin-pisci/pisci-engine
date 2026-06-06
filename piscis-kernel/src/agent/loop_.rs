@@ -2407,122 +2407,98 @@ impl AgentLoop {
             return messages.to_vec();
         }
 
-        // Build a vision request: send images + instruction to the vision model
-        let mut vision_blocks: Vec<ContentBlock> = Vec::new();
-        vision_blocks.push(ContentBlock::Text {
-            text: concat!(
-                "Describe what you see in these screenshots in detail. ",
-                "Focus on UI elements, text content, layout, and any actionable information. ",
-                "Respond in the same language as the original text.\n\n",
-                "## CRITICAL RULES — Anti-hallucination\n",
-                "1. If the image is completely black, blank, corrupted, or unreadable, respond ONLY with: ",
-                "\"[无法识别: 图片为全黑/空白/损坏，无法获取有效视觉信息]\"\n",
-                "2. NEVER fabricate, guess, or invent visual content that is not clearly visible in the image.\n",
-                "3. If the requested task (e.g. \"find the button\") cannot be completed from what is visible, ",
-                "explicitly state: \"[无法完成任务: <reason>]\" and explain why.\n",
-                "4. Only describe elements you can CONFIDENTLY identify in the image. When uncertain about an element, ",
-                "use hedging language (\"appears to be\", \"may be\") rather than asserting it as fact.\n",
-                "5. Under no circumstances pretend you can see content that is not there.",
-            ).to_string(),
-        });
-        for img in &images {
-            vision_blocks.push((*img).clone());
-        }
-
-        let vision_req = LlmRequest {
-            messages: vec![LlmMessage {
-                role: "user".into(),
-                content: MessageContent::Blocks(vision_blocks),
-            }],
-            system: Some(
-                "You are a visual analysis assistant. Your ONLY job is to describe images ACCURATELY. \
-                 You MUST NEVER fabricate, hallucinate, or invent any visual content. \
-                 If an image is blank, black, corrupted, or otherwise unreadable, say so honestly. \
-                 If a user's question cannot be answered from the visible content, say it cannot be determined. \
-                 Honesty and accuracy are absolute priorities over completeness.".to_string(),
-            ),
-            tools: vec![],
-            model: vision_model.to_string(),
-            max_tokens: 2048,
-            stream: false,
-            vision_override: Some(true),
-        };
+        const VISION_INSTRUCTION: &str = concat!(
+            "Describe what you see in this image in detail. ",
+            "Focus on UI elements, text content, layout, and any actionable information. ",
+            "Respond in the same language as the original text.\n\n",
+            "## CRITICAL RULES — Anti-hallucination\n",
+            "1. If the image is completely black, blank, corrupted, or unreadable, respond ONLY with: ",
+            "\"[无法识别: 图片为全黑/空白/损坏，无法获取有效视觉信息]\"\n",
+            "2. NEVER fabricate, guess, or invent visual content that is not clearly visible in the image.\n",
+            "3. If the requested task (e.g. \"find the button\") cannot be completed from what is visible, ",
+            "explicitly state: \"[无法完成任务: <reason>]\" and explain why.\n",
+            "4. Only describe elements you can CONFIDENTLY identify in the image. When uncertain about an element, ",
+            "use hedging language (\"appears to be\", \"may be\") rather than asserting it as fact.\n",
+            "5. Under no circumstances pretend you can see content that is not there.",
+        );
+        const VISION_SYSTEM: &str =
+            "You are a visual analysis assistant. Your ONLY job is to describe images ACCURATELY. \
+             You MUST NEVER fabricate, hallucinate, or invent any visual content. \
+             If an image is blank, black, corrupted, or otherwise unreadable, say so honestly. \
+             If a user's question cannot be answered from the visible content, say it cannot be determined. \
+             Honesty and accuracy are absolute priorities over completeness.";
 
         tracing::info!(
-            "vision_delegate: analyzing {} image(s) via separate vision model",
+            "vision_delegate: analyzing {} image(s) via separate vision model (one request per image)",
             images.len()
         );
 
-        match vision_client.complete(vision_req).await {
-            Ok(resp) if !resp.content.is_empty() => {
-                tracing::info!(
-                    "vision_delegate: got {} chars description",
-                    resp.content.len()
-                );
-                // Replace the image message with text-only description
-                let mut result = messages.to_vec();
-                let mut new_blocks: Vec<ContentBlock> = Vec::new();
-                // Keep original text parts
-                for t in &text_parts {
-                    new_blocks.push(ContentBlock::Text { text: t.clone() });
-                }
-                // Add vision analysis result
-                new_blocks.push(ContentBlock::Text {
-                    text: format!("\n[视觉模型分析结果]\n{}", resp.content.trim()),
-                });
-                result[idx] = LlmMessage {
+        let mut analysis_sections: Vec<String> = Vec::new();
+        for (image_idx, img) in images.iter().enumerate() {
+            let vision_blocks = vec![
+                ContentBlock::Text {
+                    text: VISION_INSTRUCTION.to_string(),
+                },
+                (*img).clone(),
+            ];
+            let vision_req = LlmRequest {
+                messages: vec![LlmMessage {
                     role: "user".into(),
-                    content: MessageContent::Blocks(new_blocks),
-                };
-                result
-            }
-            Ok(_) => {
-                tracing::warn!("vision_delegate: empty response from vision model");
-                // Vision model returned empty — treat as failure.
-                // Strip image blocks so the main LLM does not see raw images,
-                // and inject an explicit failure note so the main LLM does NOT
-                // hallucinate visual content.
-                let mut result = messages.to_vec();
-                let mut new_blocks: Vec<ContentBlock> = Vec::new();
-                for t in &text_parts {
-                    new_blocks.push(ContentBlock::Text { text: t.clone() });
+                    content: MessageContent::Blocks(vision_blocks),
+                }],
+                system: Some(VISION_SYSTEM.to_string()),
+                tools: vec![],
+                model: vision_model.to_string(),
+                max_tokens: 2048,
+                stream: false,
+                vision_override: Some(true),
+            };
+
+            match vision_client.complete(vision_req).await {
+                Ok(resp) if !resp.content.is_empty() => {
+                    tracing::info!(
+                        "vision_delegate: image {} got {} chars description",
+                        image_idx + 1,
+                        resp.content.len()
+                    );
+                    analysis_sections.push(resp.content.trim().to_string());
                 }
-                new_blocks.push(ContentBlock::Text {
-                    text: "\n[视觉模型分析失败: 视觉模型返回了空响应，未能获取任何视觉信息]\
-                           \n重要提示：由于视觉分析未成功，你不得对图片内容进行任何描述、猜测或编造。\
-                           请如实告知用户视觉模型未能识别图片内容，建议重新截图或检查视觉模型配置。"
-                        .to_string(),
-                });
-                result[idx] = LlmMessage {
-                    role: "user".into(),
-                    content: MessageContent::Blocks(new_blocks),
-                };
-                result
-            }
-            Err(e) => {
-                tracing::warn!("vision_delegate: vision model failed: {}", e);
-                // On failure, strip images and add error note
-                let mut result = messages.to_vec();
-                let mut new_blocks: Vec<ContentBlock> = Vec::new();
-                for t in &text_parts {
-                    new_blocks.push(ContentBlock::Text { text: t.clone() });
+                Ok(_) => {
+                    tracing::warn!(
+                        "vision_delegate: empty response for image {}",
+                        image_idx + 1
+                    );
+                    analysis_sections.push(
+                        "[视觉模型分析失败: 视觉模型返回了空响应，未能获取任何视觉信息]"
+                            .to_string(),
+                    );
                 }
-                new_blocks.push(ContentBlock::Text {
-                    text: format!(
-                        "\n[视觉模型分析失败: {}]\
-                         \n重要提示：由于视觉分析失败，你不得对图片内容进行任何描述、猜测或编造。\
-                         请如实告知用户视觉模型无法识别图片内容（原因: {}），\
-                         建议用户检查视觉模型配置或重新截图。",
-                        e, e
-                    ),
-                });
-                result[idx] = LlmMessage {
-                    role: "user".into(),
-                    content: MessageContent::Blocks(new_blocks),
-                };
-                result
+                Err(e) => {
+                    tracing::warn!(
+                        "vision_delegate: vision model failed for image {}: {}",
+                        image_idx + 1,
+                        e
+                    );
+                    analysis_sections.push(format!("[视觉模型分析失败: {}]", e));
+                }
             }
         }
+
+        let mut result = messages.to_vec();
+        let mut new_blocks: Vec<ContentBlock> = Vec::new();
+        for t in &text_parts {
+            new_blocks.push(ContentBlock::Text { text: t.clone() });
+        }
+        for section in analysis_sections {
+            new_blocks.push(ContentBlock::Text {
+                text: format!("\n[视觉模型分析结果]\n{section}"),
+            });
+        }
+        result[idx] = LlmMessage {
+            role: "user".into(),
+            content: MessageContent::Blocks(new_blocks),
+        };
+        result
     }
 
     async fn check_tool_rate_limit(&self, ctx: &ToolContext) -> Option<String> {
