@@ -21,7 +21,7 @@ pub mod request_builder;
 pub mod runner;
 
 pub use budget::{CompactionTier, LayeredBudget};
-pub use config::{HarnessConfig, ProviderKind, StateFrameProvider, SummaryStore};
+pub use config::{ConfirmFlags, ConfirmFlagsHandle, HarnessConfig, ProviderKind, StateFrameProvider, SummaryStore};
 pub use context_builder::{ContextBuilder, FinalizedRequest, LayeredTokenBreakdown};
 pub use layered_prompt::{LayeredPrompt, LayeredPromptTokens, ToolDefMode};
 pub use request_builder::{cap_max_tokens, RequestBuilder};

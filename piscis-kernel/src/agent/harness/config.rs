@@ -112,6 +112,9 @@ pub struct ConfirmFlags {
     pub confirm_file_write: bool,
 }
 
+/// Shared live confirmation preferences — re-exported from the agent loop.
+pub type ConfirmFlagsHandle = crate::agent::loop_::ConfirmFlagsHandle;
+
 impl From<ConfirmFlags> for crate::agent::loop_::ConfirmFlags {
     fn from(f: ConfirmFlags) -> Self {
         crate::agent::loop_::ConfirmFlags {
@@ -155,8 +158,8 @@ pub struct HarnessConfig {
     pub registry: Arc<ToolRegistry>,
     /// Scene policy gate.
     pub policy: Arc<PolicyGate>,
-    /// User confirmation preferences.
-    pub confirm_flags: ConfirmFlags,
+    /// User confirmation preferences (shared handle for live updates).
+    pub confirm_flags: crate::agent::loop_::ConfirmFlagsHandle,
     /// User-configured vision override (None = auto from model id).
     pub vision_override: Option<bool>,
     /// Optional separate vision model client for image analysis delegation.
@@ -274,7 +277,7 @@ impl HarnessConfig {
         system_prompt: String,
         max_tokens: u32,
         context_window: u32,
-        confirm_flags: ConfirmFlags,
+        confirm_flags: crate::agent::loop_::ConfirmFlagsHandle,
         vision_override: Option<bool>,
         vision_delegate: Option<Box<dyn crate::llm::LlmClient>>,
         vision_model: String,
@@ -288,7 +291,7 @@ impl HarnessConfig {
             .with_layered_prompt(LayeredPrompt::from_monolithic(system_prompt))
             .with_max_tokens(max_tokens)
             .with_context_window(context_window)
-            .with_confirm_flags(confirm_flags)
+            .with_shared_confirm_flags(confirm_flags)
             .with_vision_override(vision_override)
             .with_vision_delegate(vision_delegate)
             .with_vision_model(vision_model)
@@ -503,7 +506,7 @@ impl HarnessConfig {
             db: self.persistence,
             plan_state: self.plan_state,
             confirmation_responses,
-            confirm_flags: self.confirm_flags.into(),
+            confirm_flags: self.confirm_flags.clone(),
             vision_override: self.vision_override,
             vision_delegate: self.vision_delegate,
             vision_model: self.vision_model,
@@ -545,7 +548,7 @@ impl HarnessConfigBuilder {
             layered_prompt: LayeredPrompt::default(),
             registry,
             policy,
-            confirm_flags: ConfirmFlags::default(),
+            confirm_flags: crate::agent::loop_::confirm_flags_handle(true, true),
             vision_override: None,
             vision_delegate: None,
             vision_model: String::new(),
@@ -640,7 +643,19 @@ impl HarnessConfigBuilder {
     }
 
     pub fn with_confirm_flags(mut self, cf: ConfirmFlags) -> Self {
-        self.inner.confirm_flags = cf;
+        self.inner.confirm_flags = crate::agent::loop_::confirm_flags_handle(
+            cf.confirm_shell,
+            cf.confirm_file_write,
+        );
+        self
+    }
+
+    /// Wire a shared confirmation handle (e.g. from desktop `AppState`).
+    pub fn with_shared_confirm_flags(
+        mut self,
+        handle: crate::agent::loop_::ConfirmFlagsHandle,
+    ) -> Self {
+        self.inner.confirm_flags = handle;
         self
     }
 

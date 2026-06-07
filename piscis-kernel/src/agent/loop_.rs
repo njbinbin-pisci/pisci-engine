@@ -187,10 +187,32 @@ static TOOL_RATE_STATE: Lazy<Mutex<HashMap<String, Vec<std::time::Instant>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// User-controlled confirmation flags from Settings.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct ConfirmFlags {
     pub confirm_shell: bool,
     pub confirm_file_write: bool,
+}
+
+/// Live confirmation preferences — shared across harness instances so a
+/// settings change takes effect for in-flight agent runs without restart.
+pub type ConfirmFlagsHandle = Arc<std::sync::RwLock<ConfirmFlags>>;
+
+pub fn confirm_flags_handle(confirm_shell: bool, confirm_file_write: bool) -> ConfirmFlagsHandle {
+    Arc::new(std::sync::RwLock::new(ConfirmFlags {
+        confirm_shell,
+        confirm_file_write,
+    }))
+}
+
+pub fn sync_confirm_flags(
+    handle: &ConfirmFlagsHandle,
+    confirm_shell: bool,
+    confirm_file_write: bool,
+) {
+    if let Ok(mut flags) = handle.write() {
+        flags.confirm_shell = confirm_shell;
+        flags.confirm_file_write = confirm_file_write;
+    }
 }
 
 pub type ConfirmationResponseMap = Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>>;
@@ -1927,8 +1949,8 @@ pub struct AgentLoop {
     pub plan_state: Option<PlanStateHandle>,
     /// Shared map of pending permission confirmation channels
     pub confirmation_responses: Option<ConfirmationResponseMap>,
-    /// User confirmation preferences from Settings
-    pub confirm_flags: ConfirmFlags,
+    /// User confirmation preferences from Settings (read on each tool call)
+    pub confirm_flags: ConfirmFlagsHandle,
     /// User-configured vision override (from settings.vision_enabled).
     /// None = auto-detect from model name.
     pub vision_override: Option<bool>,
@@ -2036,11 +2058,14 @@ impl AgentLoop {
                     .get(name)
                     .map(|t| t.needs_confirmation(input))
                     .unwrap_or(false);
+                let (confirm_shell, confirm_file_write) = self
+                    .confirm_flags
+                    .read()
+                    .map(|f| (f.confirm_shell, f.confirm_file_write))
+                    .unwrap_or((true, true));
                 let user_disabled = match name {
-                    "shell" | "bash" | "powershell" | "powershell_query" => {
-                        !self.confirm_flags.confirm_shell
-                    }
-                    "file_write" | "file_edit" => !self.confirm_flags.confirm_file_write,
+                    "shell" | "bash" | "powershell" | "powershell_query" => !confirm_shell,
+                    "file_write" | "file_edit" => !confirm_file_write,
                     _ => false,
                 };
                 if tool_wants_confirm && !user_disabled {
@@ -4171,7 +4196,7 @@ mod tests {
     use super::{
         build_request_messages, compact_summarise, compact_trim_tool_results,
         is_structural_schema_error, maybe_schema_correction_envelope,
-        serialize_tool_results_with_receipts, AgentLoop, ConfirmFlags,
+        serialize_tool_results_with_receipts, AgentLoop, confirm_flags_handle,
         CTX_KEEP_RECENT_TOOL_CARRIERS, CTX_PRESERVE_RECENT_TURNS, CTX_TRIM_HEAD, CTX_TRIM_TAIL,
     };
     use crate::agent::tool::{Tool, ToolContext, ToolRegistry, ToolSettings};
@@ -4330,10 +4355,7 @@ mod tests {
             db: None,
             plan_state: None,
             confirmation_responses: None,
-            confirm_flags: ConfirmFlags {
-                confirm_shell: false,
-                confirm_file_write: false,
-            },
+            confirm_flags: confirm_flags_handle(false, false),
             vision_override: Some(false),
             vision_delegate: None,
             vision_model: String::new(),
