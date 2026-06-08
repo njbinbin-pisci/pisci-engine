@@ -206,8 +206,19 @@ async fn execute_todo_turn_inner(
 ) -> anyhow::Result<KoiExecResult> {
     let canonical_pool_id = pool_session.as_ref().map(|p| p.id.clone());
 
-    let workspace =
+    let mut workspace =
         maybe_setup_worktree(store, cfg, canonical_pool_id.as_deref(), &koi, &todo).await;
+    // When worktrees are disabled or git worktree setup fails (e.g. no
+    // `.git` yet), run inside the pool's project directory instead of
+    // leaving workspace unset — the desktop runtime would otherwise fall
+    // back to the global settings workspace_root.
+    if workspace.is_none() {
+        workspace = pool_session
+            .as_ref()
+            .and_then(|p| p.project_dir.as_ref())
+            .filter(|d| !d.trim().is_empty())
+            .map(|d| PathBuf::from(d));
+    }
 
     if workspace.is_some() {
         let branch = git::koi_branch_name(&koi.name, &todo.id);

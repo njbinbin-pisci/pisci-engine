@@ -40,6 +40,16 @@ pub struct JournalChange {
     pub applied: bool,
 }
 
+/// Before/after file contents for inline diff cards in the chat stream.
+#[derive(Debug, Clone, Serialize)]
+pub struct JournalFileDiff {
+    pub id: i64,
+    pub rel_path: String,
+    pub existed: bool,
+    pub before: Option<String>,
+    pub after: String,
+}
+
 /// Workspace-scoped file journal. Cheap to open; backed by a SQLite file.
 pub struct FileJournal {
     conn: Mutex<Connection>,
@@ -208,6 +218,41 @@ impl FileJournal {
             }
         }
         Ok(out)
+    }
+
+    /// Load before/after text for each applied change in a turn (for inline diffs).
+    pub fn get_turn_file_diffs(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+    ) -> Result<Vec<JournalFileDiff>> {
+        let changes = self.list_changes(session_id, turn_id)?;
+        let mut out = Vec::with_capacity(changes.len());
+        for c in changes {
+            let (before, after) = self.read_change_contents(c.id)?;
+            out.push(JournalFileDiff {
+                id: c.id,
+                rel_path: c.rel_path,
+                existed: c.existed,
+                before,
+                after,
+            });
+        }
+        Ok(out)
+    }
+
+    fn read_change_contents(&self, change_id: i64) -> Result<(Option<String>, String)> {
+        let conn = self.conn.lock().unwrap();
+        let (rel, before_blob): (String, Option<Vec<u8>>) = conn.query_row(
+            "SELECT rel_path, before_content FROM file_snapshots WHERE id = ?1",
+            params![change_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        drop(conn);
+        let before = before_blob.map(|b| String::from_utf8_lossy(&b).into_owned());
+        let abs = self.abs_path(&rel);
+        let after = std::fs::read_to_string(&abs).unwrap_or_default();
+        Ok((before, after))
     }
 
     /// Undo all applied changes in a turn, restoring pre-edit content.

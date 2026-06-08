@@ -3369,7 +3369,14 @@ impl AgentLoop {
                             }
                             break;
                         }
-                        return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("LLM call failed")));
+                        let err =
+                            last_err.unwrap_or_else(|| anyhow::anyhow!("LLM call failed"));
+                        let _ = event_tx
+                            .send(AgentEvent::Error {
+                                message: err.to_string(),
+                            })
+                            .await;
+                        return Err(err);
                     }
                 }
             };
