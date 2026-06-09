@@ -2915,6 +2915,14 @@ impl AgentLoop {
                     .await;
 
                 if outcome.changed {
+                    if let Some(hooks) = &self.hooks {
+                        hooks
+                            .on_context_event(&crate::agent::hooks::ContextHookEvent::AfterCompact {
+                                session_id: &ctx.session_id,
+                                message_count: outcome.messages.len(),
+                            })
+                            .await;
+                    }
                     // Account for summariser billing.
                     total_input = total_input.saturating_add(outcome.summary_input_tokens);
                     total_output = total_output.saturating_add(outcome.summary_output_tokens);
@@ -3241,6 +3249,16 @@ impl AgentLoop {
                                         })
                                         .await;
                                     if outcome.changed {
+                                        if let Some(hooks) = &self.hooks {
+                                            hooks
+                                                .on_context_event(
+                                                    &crate::agent::hooks::ContextHookEvent::AfterCompact {
+                                                        session_id: &ctx.session_id,
+                                                        message_count: outcome.messages.len(),
+                                                    },
+                                                )
+                                                .await;
+                                        }
                                         total_input = total_input
                                             .saturating_add(outcome.summary_input_tokens);
                                         total_output = total_output

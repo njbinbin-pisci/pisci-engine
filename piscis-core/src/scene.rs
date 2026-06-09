@@ -70,6 +70,7 @@ const POOL_COORDINATOR_TOOLS: &[&str] = &[
     "pool_org",
     "vision_context",
     "skill_list",
+    "skill_manage",
     "ssh",
     "pdf",
 ];
@@ -92,6 +93,7 @@ const KOI_TASK_TOOLS: &[&str] = &[
     "pool_chat",
     "vision_context",
     "skill_list",
+    "skill_manage",
     "ssh",
     "pdf",
 ];
@@ -112,6 +114,7 @@ const KOI_PERSONA_TOOLS: &[&str] = &[
     "call_fish",
     "vision_context",
     "skill_list",
+    "skill_manage",
     "ssh",
     "pdf",
 ];

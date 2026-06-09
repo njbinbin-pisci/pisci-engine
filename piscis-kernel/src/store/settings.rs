@@ -145,6 +145,73 @@ pub fn is_local_ollama_openai_provider(provider: &str, base_url: &str) -> bool {
     .any(|prefix| has_local_ollama_prefix(&url, prefix))
 }
 
+/// Tunables for background skill review, curator maintenance, and evolution policy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillEvolutionSettings {
+    /// Run background skill/memory review after each agent turn.
+    #[serde(default = "default_true")]
+    pub review_enabled: bool,
+    /// When false, skip per-turn review (manual/curator paths still apply).
+    #[serde(default = "default_true")]
+    pub review_every_turn: bool,
+    /// Minimum tool-call count in a turn before creating a new umbrella draft skill.
+    #[serde(default = "default_create_skill_min_tool_calls")]
+    pub create_skill_min_tool_calls: u32,
+    /// Minimum agent turns between new umbrella draft skill creations.
+    #[serde(default = "default_umbrella_skill_interval_turns")]
+    pub umbrella_skill_interval_turns: u32,
+    /// Curator auto-run interval in hours (default 168 = 7 days).
+    #[serde(default = "default_curator_interval_hours")]
+    pub curator_interval_hours: u32,
+    /// Minimum system idle hours before curator may auto-run.
+    #[serde(default = "default_curator_min_idle_hours")]
+    pub curator_min_idle_hours: u32,
+    /// Mark agent-created skills as stale after N days without use.
+    #[serde(default = "default_stale_after_days")]
+    pub stale_after_days: u32,
+    /// Archive agent-created stale skills after N days without use.
+    #[serde(default = "default_archive_after_days")]
+    pub archive_after_days: u32,
+    /// LLM pass to merge near-duplicate drafts and patch drift (curator phase 2).
+    #[serde(default = "default_true")]
+    pub curator_llm_merge_enabled: bool,
+}
+
+impl Default for SkillEvolutionSettings {
+    fn default() -> Self {
+        Self {
+            review_enabled: true,
+            review_every_turn: true,
+            create_skill_min_tool_calls: default_create_skill_min_tool_calls(),
+            umbrella_skill_interval_turns: default_umbrella_skill_interval_turns(),
+            curator_interval_hours: default_curator_interval_hours(),
+            curator_min_idle_hours: default_curator_min_idle_hours(),
+            stale_after_days: default_stale_after_days(),
+            archive_after_days: default_archive_after_days(),
+            curator_llm_merge_enabled: true,
+        }
+    }
+}
+
+fn default_create_skill_min_tool_calls() -> u32 {
+    5
+}
+fn default_umbrella_skill_interval_turns() -> u32 {
+    10
+}
+fn default_curator_interval_hours() -> u32 {
+    168
+}
+fn default_curator_min_idle_hours() -> u32 {
+    2
+}
+fn default_stale_after_days() -> u32 {
+    30
+}
+fn default_archive_after_days() -> u32 {
+    90
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     /// Anthropic API key
@@ -458,6 +525,10 @@ pub struct Settings {
     #[serde(default)]
     pub starter_kois_initialized: bool,
 
+    // ── Skill evolution ─────────────────────────────────────────────────────
+    #[serde(default)]
+    pub skill_evolution: SkillEvolutionSettings,
+
     // ── User Tools ──────────────────────────────────────────────────────────
     /// Per-user-tool config values, keyed by tool name.
     /// Each value is a JSON object with the fields from the tool's config_schema.
@@ -753,6 +824,7 @@ impl Default for Settings {
             heartbeat_interval_mins: default_heartbeat_interval(),
             heartbeat_prompt: default_heartbeat_prompt(),
             starter_kois_initialized: false,
+            skill_evolution: SkillEvolutionSettings::default(),
             user_tool_configs: HashMap::new(),
             builtin_tool_enabled: HashMap::new(),
             mcp_servers: Vec::new(),

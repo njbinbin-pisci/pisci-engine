@@ -218,6 +218,44 @@ pub struct Skill {
     pub config: String, // JSON string
 }
 
+/// One recorded change to a skill (patch/edit/create).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillRevision {
+    pub id: String,
+    pub skill_id: String,
+    pub session_id: Option<String>,
+    pub origin: String,
+    pub diff_summary: Option<String>,
+    pub content_before_hash: Option<String>,
+    pub content_after_hash: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Per-skill usage telemetry for curator and evolution policy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillUsage {
+    pub skill_id: String,
+    pub view_count: i64,
+    pub use_count: i64,
+    pub patch_count: i64,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub last_patched_at: Option<DateTime<Utc>>,
+    pub state: String,
+    pub pinned: bool,
+    pub created_by: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanSnapshot {
+    pub id: String,
+    pub session_id: String,
+    /// Short label for the turn (user goal snippet or auto-generated).
+    pub label: String,
+    /// JSON array of plan_todo items from the chat UI.
+    pub items_json: String,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEntry {
     pub id: String,
@@ -452,6 +490,41 @@ impl Database {
 
             CREATE INDEX IF NOT EXISTS idx_audit_session ON audit_log(session_id, timestamp);
             CREATE INDEX IF NOT EXISTS idx_audit_tool ON audit_log(tool_name, timestamp);
+
+            CREATE TABLE IF NOT EXISTS plan_snapshots (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                label TEXT NOT NULL DEFAULT '',
+                items_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_plan_snapshots_session ON plan_snapshots(session_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS skill_revisions (
+                id TEXT PRIMARY KEY,
+                skill_id TEXT NOT NULL,
+                session_id TEXT,
+                origin TEXT NOT NULL DEFAULT 'agent',
+                diff_summary TEXT,
+                content_before_hash TEXT,
+                content_after_hash TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_skill_revisions_skill ON skill_revisions(skill_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_skill_revisions_session ON skill_revisions(session_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS skill_usage (
+                skill_id TEXT PRIMARY KEY,
+                view_count INTEGER NOT NULL DEFAULT 0,
+                use_count INTEGER NOT NULL DEFAULT 0,
+                patch_count INTEGER NOT NULL DEFAULT 0,
+                last_used_at TEXT,
+                last_patched_at TEXT,
+                state TEXT NOT NULL DEFAULT 'active',
+                pinned INTEGER NOT NULL DEFAULT 0,
+                created_by TEXT
+            );
 
             CREATE TABLE IF NOT EXISTS session_artifacts (
                 id TEXT PRIMARY KEY,
@@ -1269,6 +1342,34 @@ impl Database {
         let rows = stmt.query_map(params![limit, offset], map_session_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
+    }
+
+    /// Sessions currently in `running` status (agent loop active).
+    pub fn count_running_sessions(&self) -> Result<i64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sessions WHERE status = 'running'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// True when no session is running and the latest session activity is older than `min_hours`.
+    pub fn is_system_idle_for_hours(&self, min_hours: u32) -> Result<bool> {
+        if self.count_running_sessions()? > 0 {
+            return Ok(false);
+        }
+        let latest: Option<String> = self
+            .conn
+            .query_row("SELECT MAX(updated_at) FROM sessions", [], |r| r.get(0))
+            .unwrap_or(None);
+        let Some(latest) = latest else {
+            return Ok(true);
+        };
+        let parsed = latest
+            .parse::<DateTime<Utc>>()
+            .unwrap_or_else(|_| Utc::now());
+        Ok(Utc::now().signed_duration_since(parsed).num_hours() >= min_hours as i64)
     }
 
     pub fn delete_session(&self, id: &str) -> Result<()> {
@@ -2096,11 +2197,229 @@ impl Database {
     /// Uses the skill name (lowercased, sanitised) as the ID.
     /// If a record with the same ID already exists it is updated in-place.
     pub fn upsert_skill(&self, id: &str, name: &str, description: &str, icon: &str) -> Result<()> {
+        self.upsert_skill_with_config(id, name, description, icon, None)
+    }
+
+    /// Like [`upsert_skill`] but preserves or sets the JSON `config` blob.
+    pub fn upsert_skill_with_config(
+        &self,
+        id: &str,
+        name: &str,
+        description: &str,
+        icon: &str,
+        config: Option<&str>,
+    ) -> Result<()> {
+        let config_json = config.unwrap_or("{}");
         self.conn.execute(
             "INSERT INTO skills (id, name, description, enabled, icon, config) \
-             VALUES (?1, ?2, ?3, 1, ?4, '{}') \
-             ON CONFLICT(id) DO UPDATE SET name=excluded.name, description=excluded.description, icon=excluded.icon",
-            params![id, name, description, icon],
+             VALUES (?1, ?2, ?3, 1, ?4, ?5) \
+             ON CONFLICT(id) DO UPDATE SET \
+               name=excluded.name, \
+               description=excluded.description, \
+               icon=excluded.icon, \
+               config=CASE WHEN excluded.config != '{}' THEN excluded.config ELSE skills.config END",
+            params![id, name, description, icon, config_json],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_skill_config(&self, id: &str, config: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE skills SET config = ?1 WHERE id = ?2",
+            params![config, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_skill(&self, id: &str) -> Result<Option<Skill>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, description, enabled, icon, config FROM skills WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query(params![id])?;
+        if let Some(r) = rows.next()? {
+            Ok(Some(Skill {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                description: r.get(2)?,
+                enabled: r.get::<_, i64>(3)? != 0,
+                icon: r.get(4)?,
+                config: r.get(5)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn insert_skill_revision(
+        &self,
+        skill_id: &str,
+        session_id: Option<&str>,
+        origin: &str,
+        diff_summary: Option<&str>,
+        content_before_hash: Option<&str>,
+        content_after_hash: Option<&str>,
+    ) -> Result<SkillRevision> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = Utc::now();
+        self.conn.execute(
+            "INSERT INTO skill_revisions \
+             (id, skill_id, session_id, origin, diff_summary, content_before_hash, content_after_hash, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                id,
+                skill_id,
+                session_id,
+                origin,
+                diff_summary,
+                content_before_hash,
+                content_after_hash,
+                now.to_rfc3339(),
+            ],
+        )?;
+        Ok(SkillRevision {
+            id,
+            skill_id: skill_id.to_string(),
+            session_id: session_id.map(String::from),
+            origin: origin.to_string(),
+            diff_summary: diff_summary.map(String::from),
+            content_before_hash: content_before_hash.map(String::from),
+            content_after_hash: content_after_hash.map(String::from),
+            created_at: now,
+        })
+    }
+
+    pub fn list_skill_revisions_for_skill(
+        &self,
+        skill_id: &str,
+        limit: i64,
+    ) -> Result<Vec<SkillRevision>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, skill_id, session_id, origin, diff_summary, content_before_hash, content_after_hash, created_at \
+             FROM skill_revisions WHERE skill_id = ?1 ORDER BY created_at DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![skill_id, limit], |r| {
+            Ok(SkillRevision {
+                id: r.get(0)?,
+                skill_id: r.get(1)?,
+                session_id: r.get(2)?,
+                origin: r.get(3)?,
+                diff_summary: r.get(4)?,
+                content_before_hash: r.get(5)?,
+                content_after_hash: r.get(6)?,
+                created_at: r
+                    .get::<_, String>(7)?
+                    .parse::<DateTime<Utc>>()
+                    .unwrap_or_else(|_| Utc::now()),
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn list_skill_revisions_for_session(
+        &self,
+        session_id: &str,
+        limit: i64,
+    ) -> Result<Vec<SkillRevision>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, skill_id, session_id, origin, diff_summary, content_before_hash, content_after_hash, created_at \
+             FROM skill_revisions WHERE session_id = ?1 ORDER BY created_at DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![session_id, limit], |r| {
+            Ok(SkillRevision {
+                id: r.get(0)?,
+                skill_id: r.get(1)?,
+                session_id: r.get(2)?,
+                origin: r.get(3)?,
+                diff_summary: r.get(4)?,
+                content_before_hash: r.get(5)?,
+                content_after_hash: r.get(6)?,
+                created_at: r
+                    .get::<_, String>(7)?
+                    .parse::<DateTime<Utc>>()
+                    .unwrap_or_else(|_| Utc::now()),
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn ensure_skill_usage(&self, skill_id: &str, created_by: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO skill_usage (skill_id, created_by) VALUES (?1, ?2) \
+             ON CONFLICT(skill_id) DO NOTHING",
+            params![skill_id, created_by],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_skill_usage(&self, skill_id: &str) -> Result<Option<SkillUsage>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT skill_id, view_count, use_count, patch_count, last_used_at, last_patched_at, state, pinned, created_by \
+             FROM skill_usage WHERE skill_id = ?1",
+        )?;
+        let mut rows = stmt.query(params![skill_id])?;
+        if let Some(r) = rows.next()? {
+            Ok(Some(Self::row_to_skill_usage(r)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn list_skill_usage(&self) -> Result<Vec<SkillUsage>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT skill_id, view_count, use_count, patch_count, last_used_at, last_patched_at, state, pinned, created_by \
+             FROM skill_usage ORDER BY use_count DESC, view_count DESC",
+        )?;
+        let rows = stmt.query_map([], Self::row_to_skill_usage)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn bump_skill_view(&self, skill_id: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO skill_usage (skill_id, view_count, last_used_at) VALUES (?1, 1, ?2) \
+             ON CONFLICT(skill_id) DO UPDATE SET view_count = view_count + 1, last_used_at = ?2",
+            params![skill_id, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn bump_skill_use(&self, skill_id: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO skill_usage (skill_id, use_count, last_used_at) VALUES (?1, 1, ?2) \
+             ON CONFLICT(skill_id) DO UPDATE SET use_count = use_count + 1, last_used_at = ?2",
+            params![skill_id, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn bump_skill_patch(&self, skill_id: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO skill_usage (skill_id, patch_count, last_patched_at) VALUES (?1, 1, ?2) \
+             ON CONFLICT(skill_id) DO UPDATE SET patch_count = patch_count + 1, last_patched_at = ?2",
+            params![skill_id, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_skill_usage_state(&self, skill_id: &str, state: &str) -> Result<()> {
+        self.ensure_skill_usage(skill_id, None)?;
+        self.conn.execute(
+            "UPDATE skill_usage SET state = ?1 WHERE skill_id = ?2",
+            params![state, skill_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_skill_pinned(&self, skill_id: &str, pinned: bool) -> Result<()> {
+        self.ensure_skill_usage(skill_id, None)?;
+        self.conn.execute(
+            "UPDATE skill_usage SET pinned = ?1 WHERE skill_id = ?2",
+            params![pinned as i64, skill_id],
         )?;
         Ok(())
     }
@@ -2324,6 +2643,68 @@ impl Database {
                 is_error: r.get::<_, i64>(7)? != 0,
             })
         })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn insert_plan_snapshot(
+        &self,
+        session_id: &str,
+        label: &str,
+        items_json: &str,
+    ) -> Result<PlanSnapshot> {
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO plan_snapshots (id, session_id, label, items_json, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, session_id, label, items_json, now_str],
+        )?;
+        Ok(PlanSnapshot {
+            id,
+            session_id: session_id.to_string(),
+            label: label.to_string(),
+            items_json: items_json.to_string(),
+            created_at: now,
+        })
+    }
+
+    pub fn list_plan_snapshots_for_session(
+        &self,
+        session_id: &str,
+        limit: i64,
+    ) -> Result<Vec<PlanSnapshot>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, label, items_json, created_at \
+             FROM plan_snapshots WHERE session_id = ?1 \
+             ORDER BY created_at ASC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![session_id, limit], |r| {
+            Ok(PlanSnapshot {
+                id: r.get(0)?,
+                session_id: r.get(1)?,
+                label: r.get(2)?,
+                items_json: r.get(3)?,
+                created_at: parse_datetime(r.get(4)?),
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Distinct session ids that appear in audit_log or plan_snapshots (recent first).
+    pub fn list_activity_session_ids(&self, limit: i64) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id, MAX(ts) AS latest FROM ( \
+                SELECT session_id, timestamp AS ts FROM audit_log \
+                UNION ALL \
+                SELECT session_id, created_at AS ts FROM plan_snapshots \
+                UNION ALL \
+                SELECT session_id, created_at AS ts FROM session_artifacts \
+             ) GROUP BY session_id ORDER BY latest DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |r| r.get(0))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
@@ -4246,6 +4627,24 @@ impl Database {
             )?
         };
         Ok(count as u32)
+    }
+
+    fn row_to_skill_usage(r: &rusqlite::Row<'_>) -> rusqlite::Result<SkillUsage> {
+        Ok(SkillUsage {
+            skill_id: r.get(0)?,
+            view_count: r.get(1)?,
+            use_count: r.get(2)?,
+            patch_count: r.get(3)?,
+            last_used_at: r
+                .get::<_, Option<String>>(4)?
+                .and_then(|s| s.parse().ok()),
+            last_patched_at: r
+                .get::<_, Option<String>>(5)?
+                .and_then(|s| s.parse().ok()),
+            state: r.get(6)?,
+            pinned: r.get::<_, i64>(7)? != 0,
+            created_by: r.get(8)?,
+        })
     }
 }
 

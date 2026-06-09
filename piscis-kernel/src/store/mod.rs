@@ -8,4 +8,4 @@ pub mod db;
 pub mod settings;
 
 pub use db::Database;
-pub use settings::Settings;
+pub use settings::{Settings, SkillEvolutionSettings};
