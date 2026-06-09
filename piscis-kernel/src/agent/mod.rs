@@ -10,6 +10,7 @@ pub mod loop_strategy;
 pub mod message_utils;
 pub mod messages;
 pub mod plan;
+pub mod plan_doc;
 pub mod rule_preprocess;
 pub mod state_frame;
 pub mod summary_worker;

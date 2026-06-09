@@ -328,6 +328,7 @@ pub async fn run_piscis_turn_cancellable(
         pool_session_id: None,
         tool_use_id: None,
         cancel: cancel.clone(),
+        loop_halt: None,
     };
 
     // ── Event bridge ───────────────────────────────────────────────────

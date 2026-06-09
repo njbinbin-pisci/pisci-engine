@@ -21,6 +21,7 @@ pub mod mcp;
 pub mod memory_tool;
 pub mod pdf;
 pub mod plan_todo;
+pub mod plan_write;
 pub mod pool_chat;
 pub mod pool_org;
 pub mod process_control;
@@ -199,6 +200,9 @@ pub fn register_neutral_into(registry: &mut ToolRegistry, cfg: &NeutralToolsConf
                 event_sink: sink.clone(),
             }));
         }
+    }
+    if cfg.is_enabled("plan_write") {
+        registry.register(Box::new(plan_write::PlanWriteTool));
     }
 
     // ── User-authored JSON tools ────────────────────────────────────

@@ -235,6 +235,7 @@ async fn pool_chat_tool_rejects_piscis_send_but_allows_koi_send() {
         pool_session_id: Some(pool_id.clone()),
         tool_use_id: None,
         cancel: Arc::new(AtomicBool::new(false)),
+        loop_halt: None,
     };
 
     let piscis_result = tool

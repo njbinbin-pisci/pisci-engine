@@ -99,7 +99,7 @@ pub fn render_receipt(
         "file_list" | "file_search" => render_file_listing(tool_name, input, full, is_error),
         "web_search" => render_web_search(input, full, is_error),
         "browser" => render_browser(input, full, is_error),
-        "plan_update" | "plan_todo" => render_plan(input, full),
+        "plan_update" | "plan_todo" | "plan_write" => render_plan(input, full),
         "memory_store" | "memory_recall" | "memory_search" | "memory_list" => {
             render_memory(tool_name, input, full, is_error)
         }

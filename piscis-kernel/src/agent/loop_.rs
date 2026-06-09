@@ -3740,6 +3740,15 @@ impl AgentLoop {
                 break;
             }
 
+            if ctx
+                .loop_halt
+                .as_ref()
+                .is_some_and(|h| h.load(Ordering::Relaxed))
+            {
+                info!("agent loop halted by host (plan ready / await user build)");
+                break;
+            }
+
             if let Some(reminder) = warning_reminder {
                 let reminder_msg = LlmMessage {
                     role: "user".into(),
@@ -4398,6 +4407,7 @@ mod tests {
             pool_session_id: None,
             tool_use_id: None,
             cancel: cancel.clone(),
+            loop_halt: None,
         };
 
         let (messages, _, _) = tokio::time::timeout(

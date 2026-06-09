@@ -64,6 +64,9 @@ pub struct ToolContext {
     pub tool_use_id: Option<String>,
     /// Cooperative cancellation flag for long-running tools.
     pub cancel: Arc<AtomicBool>,
+    /// When set by a host tool (e.g. plan ready UI), the agent loop exits gracefully
+    /// after the current tool batch completes.
+    pub loop_halt: Option<Arc<AtomicBool>>,
 }
 
 impl ToolContext {
