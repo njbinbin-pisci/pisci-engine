@@ -13,7 +13,13 @@ pub const PLANS_DIR: &str = ".agentz/plans";
 pub fn default_plan_rel_path(session_id: &str) -> String {
     let safe = session_id
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect::<String>();
     format!("{PLANS_DIR}/{safe}.md")
 }
@@ -33,23 +39,22 @@ pub fn is_allowed_plan_path(workspace_root: &Path, rel_or_abs: &str) -> bool {
     let canonical_root = workspace_root
         .canonicalize()
         .unwrap_or_else(|_| workspace_root.to_path_buf());
-    let canonical = resolved
-        .canonicalize()
-        .unwrap_or(resolved);
+    let canonical = resolved.canonicalize().unwrap_or(resolved);
     let plans = canonical_root.join(PLANS_DIR);
     if !canonical.starts_with(&plans) {
         return false;
     }
-    matches!(
-        canonical.extension().and_then(|e| e.to_str()),
-        Some("md")
-    )
+    matches!(canonical.extension().and_then(|e| e.to_str()), Some("md"))
 }
 
 /// Starter template injected when the agent creates a new plan file.
 pub fn plan_template(title: &str, session_id: &str) -> String {
     let title = title.trim();
-    let title = if title.is_empty() { "未命名任务" } else { title };
+    let title = if title.is_empty() {
+        "未命名任务"
+    } else {
+        title
+    };
     format!(
         r#"---
 title: "{title}"
@@ -82,8 +87,7 @@ created: "{date}"
 - **执行记录**:
   - （Agent 模式填写：实际做了什么、证据链接、阻塞原因等）
 
-"#
-    ,
+"#,
         date = chrono::Utc::now().format("%Y-%m-%d"),
     )
 }
@@ -97,10 +101,7 @@ pub fn validate_plan_content(content: &str) -> Result<(), String> {
     if !trimmed.contains("# 执行步骤") && !trimmed.contains("## Step") {
         return Err("计划必须包含「# 执行步骤」章节，且每步以 `## Step N:` 标题组织".into());
     }
-    let step_count = trimmed
-        .lines()
-        .filter(|l| l.starts_with("## Step"))
-        .count();
+    let step_count = trimmed.lines().filter(|l| l.starts_with("## Step")).count();
     if step_count == 0 {
         return Err("至少定义 1 个原子步骤（`## Step N: id — 标题`）".into());
     }

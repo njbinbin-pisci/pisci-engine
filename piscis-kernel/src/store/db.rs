@@ -4635,12 +4635,8 @@ impl Database {
             view_count: r.get(1)?,
             use_count: r.get(2)?,
             patch_count: r.get(3)?,
-            last_used_at: r
-                .get::<_, Option<String>>(4)?
-                .and_then(|s| s.parse().ok()),
-            last_patched_at: r
-                .get::<_, Option<String>>(5)?
-                .and_then(|s| s.parse().ok()),
+            last_used_at: r.get::<_, Option<String>>(4)?.and_then(|s| s.parse().ok()),
+            last_patched_at: r.get::<_, Option<String>>(5)?.and_then(|s| s.parse().ok()),
             state: r.get(6)?,
             pinned: r.get::<_, i64>(7)? != 0,
             created_by: r.get(8)?,

@@ -4,8 +4,7 @@
 //! mode so the agent can update step status and execution records.
 
 use crate::agent::plan_doc::{
-    default_plan_rel_path, is_allowed_plan_path, plan_template, validate_plan_content,
-    PLANS_DIR,
+    default_plan_rel_path, is_allowed_plan_path, plan_template, validate_plan_content, PLANS_DIR,
 };
 use crate::agent::tool::{Tool, ToolContext, ToolResult};
 use async_trait::async_trait;

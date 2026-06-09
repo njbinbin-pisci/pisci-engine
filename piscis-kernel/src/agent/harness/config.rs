@@ -643,10 +643,8 @@ impl HarnessConfigBuilder {
     }
 
     pub fn with_confirm_flags(mut self, cf: ConfirmFlags) -> Self {
-        self.inner.confirm_flags = crate::agent::loop_::confirm_flags_handle(
-            cf.confirm_shell,
-            cf.confirm_file_write,
-        );
+        self.inner.confirm_flags =
+            crate::agent::loop_::confirm_flags_handle(cf.confirm_shell, cf.confirm_file_write);
         self
     }
 

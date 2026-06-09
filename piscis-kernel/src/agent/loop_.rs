@@ -2917,10 +2917,12 @@ impl AgentLoop {
                 if outcome.changed {
                     if let Some(hooks) = &self.hooks {
                         hooks
-                            .on_context_event(&crate::agent::hooks::ContextHookEvent::AfterCompact {
-                                session_id: &ctx.session_id,
-                                message_count: outcome.messages.len(),
-                            })
+                            .on_context_event(
+                                &crate::agent::hooks::ContextHookEvent::AfterCompact {
+                                    session_id: &ctx.session_id,
+                                    message_count: outcome.messages.len(),
+                                },
+                            )
                             .await;
                     }
                     // Account for summariser billing.
@@ -3389,8 +3391,7 @@ impl AgentLoop {
                             }
                             break;
                         }
-                        let err =
-                            last_err.unwrap_or_else(|| anyhow::anyhow!("LLM call failed"));
+                        let err = last_err.unwrap_or_else(|| anyhow::anyhow!("LLM call failed"));
                         let _ = event_tx
                             .send(AgentEvent::Error {
                                 message: err.to_string(),
@@ -3747,8 +3748,7 @@ impl AgentLoop {
                 .await;
             }
             messages = crate::agent::message_utils::collapse_superseded_tool_failures(messages);
-            messages =
-                crate::agent::message_utils::sanitize_tool_use_result_pairing(messages);
+            messages = crate::agent::message_utils::sanitize_tool_use_result_pairing(messages);
             messages = crate::agent::message_utils::strip_ephemeral_tool_exchanges(messages);
             new_messages =
                 crate::agent::message_utils::strip_ephemeral_tool_exchanges(new_messages);
@@ -4239,10 +4239,10 @@ fn audit_action_label(tool_name: &str, input: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_request_messages, compact_summarise, compact_trim_tool_results,
+        build_request_messages, compact_summarise, compact_trim_tool_results, confirm_flags_handle,
         is_structural_schema_error, maybe_schema_correction_envelope,
-        serialize_tool_results_with_receipts, AgentLoop, confirm_flags_handle,
-        CTX_KEEP_RECENT_TOOL_CARRIERS, CTX_PRESERVE_RECENT_TURNS, CTX_TRIM_HEAD, CTX_TRIM_TAIL,
+        serialize_tool_results_with_receipts, AgentLoop, CTX_KEEP_RECENT_TOOL_CARRIERS,
+        CTX_PRESERVE_RECENT_TURNS, CTX_TRIM_HEAD, CTX_TRIM_TAIL,
     };
     use crate::agent::tool::{Tool, ToolContext, ToolRegistry, ToolSettings};
     use crate::llm::{ContentBlock, LlmChunk, LlmMessage, LlmRequest, LlmResponse, MessageContent};
