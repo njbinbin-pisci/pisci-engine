@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.8.55] - 2026-06-06
+
+### Fixed
+- **OpenAI tool_calls pairing**: per-`tool_use_id` sanitize strips partially satisfied assistant tool calls (cancel / parallel interrupt / supersede collapse) so the API no longer returns 400 for orphaned `tool_call_id`s.
+- **Agent loop cancel**: inject synthetic error `ToolResult`s for unexecuted tools before persisting; sanitize pairing after each tool round and in `build_request_messages` before every LLM call.
+
+## [0.8.54] - 2026-06-08
+
+### Added
+- Journal turn diffs and improved agent loop error surfacing.
+
 ## [0.8.47] - 2026-06-07
 
 ### Added

@@ -1293,7 +1293,9 @@ pub fn build_request_messages(
     recent_full_turns: usize,
     recent_tool_carriers: usize,
 ) -> Vec<LlmMessage> {
-    let messages = crate::agent::message_utils::strip_ephemeral_tool_exchanges(messages.to_vec());
+    let messages = crate::agent::message_utils::sanitize_tool_use_result_pairing(
+        crate::agent::message_utils::strip_ephemeral_tool_exchanges(messages.to_vec()),
+    );
     let turn_cutoff = turn_based_recent_start(&messages, recent_full_turns);
     let tool_cutoff = tool_carrier_recent_start(&messages, recent_tool_carriers);
     // `min` = whichever boundary is *further back* (lower index) in the
@@ -3562,10 +3564,6 @@ impl AgentLoop {
             // Blocked tools (by loop detector) get a synthetic error result instead.
             let mut tool_result_blocks: Vec<ContentBlock> = Vec::new();
 
-            if cancel.load(Ordering::Relaxed) {
-                break;
-            }
-
             // Separate blocked, read-only, and write calls
             let active_calls: Vec<_> = tool_calls
                 .iter()
@@ -3651,6 +3649,12 @@ impl AgentLoop {
                 tool_result_blocks.extend(blocks);
             }
 
+            crate::agent::message_utils::ensure_tool_results_complete(
+                &tool_calls,
+                &mut tool_result_blocks,
+                "Tool execution was cancelled or interrupted before completion.",
+            );
+
             // ── Record results into loop detector + compute minimal receipts ─
             for block in &tool_result_blocks {
                 if let ContentBlock::ToolResult {
@@ -3725,9 +3729,16 @@ impl AgentLoop {
                 .await;
             }
             messages = crate::agent::message_utils::collapse_superseded_tool_failures(messages);
+            messages =
+                crate::agent::message_utils::sanitize_tool_use_result_pairing(messages);
             messages = crate::agent::message_utils::strip_ephemeral_tool_exchanges(messages);
             new_messages =
                 crate::agent::message_utils::strip_ephemeral_tool_exchanges(new_messages);
+
+            if cancel.load(Ordering::Relaxed) {
+                info!("agent loop cancelled after tool-result persistence");
+                break;
+            }
 
             if let Some(reminder) = warning_reminder {
                 let reminder_msg = LlmMessage {

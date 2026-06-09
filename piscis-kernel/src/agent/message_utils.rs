@@ -275,60 +275,157 @@ pub fn strip_ephemeral_tool_exchanges(mut msgs: Vec<LlmMessage>) -> Vec<LlmMessa
     msgs
 }
 
-/// Strip orphaned ToolUse blocks left over from a cancelled previous turn.
+fn collect_tool_use_ids(msg: &LlmMessage) -> Vec<String> {
+    match &msg.content {
+        MessageContent::Blocks(blocks) => blocks
+            .iter()
+            .filter_map(|b| {
+                if let ContentBlock::ToolUse { id, .. } = b {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn collect_satisfied_tool_ids(msgs: &[LlmMessage], start: usize) -> HashSet<String> {
+    let mut satisfied = HashSet::new();
+    let mut j = start;
+    while j < msgs.len() {
+        if !is_tool_result_carrier(&msgs[j]) {
+            break;
+        }
+        if let MessageContent::Blocks(blocks) = &msgs[j].content {
+            for block in blocks {
+                if let ContentBlock::ToolResult { tool_use_id, .. } = block {
+                    satisfied.insert(tool_use_id.clone());
+                }
+            }
+        }
+        j += 1;
+    }
+    satisfied
+}
+
+/// Strip orphaned ToolUse / ToolResult blocks left over from cancelled turns,
+/// partial parallel execution, or supersede collapse.
+///
+/// Unlike the legacy "next message must be a tool-result carrier" check, this
+/// requires **every** `tool_use_id` on an assistant message to have a matching
+/// `ToolResult` in the immediately following carrier sequence. Unsatisfied ids
+/// are stripped from the assistant; orphan results in the carrier window are
+/// removed as well.
 pub fn sanitize_tool_use_result_pairing(mut msgs: Vec<LlmMessage>) -> Vec<LlmMessage> {
     let mut i = 0;
     while i < msgs.len() {
-        let has_tool_use = if msgs[i].role == "assistant" {
-            match &msgs[i].content {
-                MessageContent::Blocks(blocks) => blocks
-                    .iter()
-                    .any(|b| matches!(b, ContentBlock::ToolUse { .. })),
-                _ => false,
-            }
-        } else {
-            i += 1;
-            continue;
-        };
-
-        if !has_tool_use {
+        if msgs[i].role != "assistant" {
             i += 1;
             continue;
         }
 
-        let next_is_tool_result = msgs
-            .get(i + 1)
-            .map(|next| {
-                next.role == "user"
-                    && match &next.content {
-                        MessageContent::Blocks(blocks) => blocks
-                            .iter()
-                            .any(|b| matches!(b, ContentBlock::ToolResult { .. })),
-                        _ => false,
-                    }
-            })
-            .unwrap_or(false);
+        let tool_use_ids = collect_tool_use_ids(&msgs[i]);
+        if tool_use_ids.is_empty() {
+            i += 1;
+            continue;
+        }
 
-        if !next_is_tool_result {
+        let satisfied = collect_satisfied_tool_ids(&msgs, i + 1);
+        let retained: HashSet<String> = tool_use_ids
+            .iter()
+            .filter(|id| satisfied.contains(*id))
+            .cloned()
+            .collect();
+
+        if retained.len() != tool_use_ids.len() {
+            let stripped: Vec<String> = tool_use_ids
+                .iter()
+                .filter(|id| !retained.contains(*id))
+                .cloned()
+                .collect();
             tracing::warn!(
-                "sanitize_tool_use_result_pairing: stripping orphaned ToolUse at index {}",
-                i
+                "sanitize_tool_use_result_pairing: stripping unsatisfied ToolUse ids {:?} at index {} (satisfied={:?})",
+                stripped,
+                i,
+                satisfied
             );
             if let MessageContent::Blocks(ref mut blocks) = msgs[i].content {
-                blocks.retain(|b| !matches!(b, ContentBlock::ToolUse { .. }));
+                blocks.retain(|block| match block {
+                    ContentBlock::ToolUse { id, .. } => retained.contains(id),
+                    _ => true,
+                });
             }
-            let is_empty = match &msgs[i].content {
-                MessageContent::Blocks(blocks) => blocks.is_empty(),
-                MessageContent::Text(t) => t.trim().is_empty(),
-            };
-            if is_empty {
-                msgs.remove(i);
-                continue;
+
+            let mut j = i + 1;
+            while j < msgs.len() && is_tool_result_carrier(&msgs[j]) {
+                if let MessageContent::Blocks(ref mut blocks) = msgs[j].content {
+                    blocks.retain(|block| match block {
+                        ContentBlock::ToolResult { tool_use_id, .. } => {
+                            retained.contains(tool_use_id)
+                        }
+                        _ => true,
+                    });
+                }
+                let carrier_empty = matches!(
+                    &msgs[j].content,
+                    MessageContent::Blocks(blocks) if blocks.is_empty()
+                );
+                if carrier_empty {
+                    msgs.remove(j);
+                    continue;
+                }
+                j += 1;
             }
+        }
+
+        let is_empty = match &msgs[i].content {
+            MessageContent::Blocks(blocks) => blocks.is_empty(),
+            MessageContent::Text(t) => t.trim().is_empty(),
+        };
+        if is_empty {
+            msgs.remove(i);
+            continue;
         }
         i += 1;
     }
+
+    msgs.retain(|msg| match &msg.content {
+        MessageContent::Blocks(blocks) => !blocks.is_empty(),
+        MessageContent::Text(text) => !text.trim().is_empty(),
+    });
     msgs
+}
+
+/// Ensure every planned tool call has a matching `ToolResult` block.
+/// Missing entries receive a synthetic error result (cancel / interrupt).
+pub fn ensure_tool_results_complete(
+    tool_calls: &[(String, String, serde_json::Value)],
+    blocks: &mut Vec<ContentBlock>,
+    missing_message: &str,
+) {
+    let existing: HashSet<String> = blocks
+        .iter()
+        .filter_map(|block| {
+            if let ContentBlock::ToolResult { tool_use_id, .. } = block {
+                Some(tool_use_id.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    for (id, _, _) in tool_calls {
+        if existing.contains(id) {
+            continue;
+        }
+        blocks.push(ContentBlock::ToolResult {
+            tool_use_id: id.clone(),
+            content: missing_message.to_string(),
+            is_error: true,
+        });
+    }
 }
 
 #[cfg(test)]
@@ -350,6 +447,96 @@ mod tests {
             "shell",
             &serde_json::json!({"command": "ls"})
         ));
+    }
+
+    #[test]
+    fn sanitize_tool_use_result_pairing_strips_partial_tool_calls() {
+        let msgs = vec![
+            LlmMessage {
+                role: "assistant".into(),
+                content: MessageContent::Blocks(vec![
+                    ContentBlock::ToolUse {
+                        id: "call_a".into(),
+                        name: "shell".into(),
+                        input: serde_json::json!({"command": "echo a"}),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "call_b".into(),
+                        name: "shell".into(),
+                        input: serde_json::json!({"command": "echo b"}),
+                    },
+                ]),
+            },
+            LlmMessage {
+                role: "user".into(),
+                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_a".into(),
+                    content: "ok".into(),
+                    is_error: false,
+                }]),
+            },
+            LlmMessage {
+                role: "assistant".into(),
+                content: MessageContent::text("done"),
+            },
+        ];
+        let out = sanitize_tool_use_result_pairing(msgs);
+        let tool_use_ids: Vec<String> = out
+            .iter()
+            .flat_map(|msg| collect_tool_use_ids(msg))
+            .collect();
+        assert_eq!(tool_use_ids, vec!["call_a"]);
+        assert!(out.iter().any(|msg| {
+            matches!(
+                &msg.content,
+                MessageContent::Blocks(blocks)
+                    if blocks.iter().any(|b| matches!(
+                        b,
+                        ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call_a"
+                    ))
+            )
+        }));
+        assert!(!out.iter().any(|msg| {
+            matches!(
+                &msg.content,
+                MessageContent::Blocks(blocks)
+                    if blocks.iter().any(|b| matches!(
+                        b,
+                        ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call_b"
+                    ))
+            )
+        }));
+    }
+
+    #[test]
+    fn ensure_tool_results_complete_fills_missing_ids() {
+        let tool_calls = vec![
+            (
+                "call_a".into(),
+                "shell".into(),
+                serde_json::json!({"command": "echo"}),
+            ),
+            (
+                "call_b".into(),
+                "shell".into(),
+                serde_json::json!({"command": "pwd"}),
+            ),
+        ];
+        let mut blocks = vec![ContentBlock::ToolResult {
+            tool_use_id: "call_a".into(),
+            content: "ok".into(),
+            is_error: false,
+        }];
+        ensure_tool_results_complete(&tool_calls, &mut blocks, "cancelled");
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks.iter().any(|b| matches!(
+            b,
+            ContentBlock::ToolResult {
+                tool_use_id,
+                is_error: true,
+                ..
+            } if tool_use_id == "call_b"
+        )));
     }
 
     #[test]
