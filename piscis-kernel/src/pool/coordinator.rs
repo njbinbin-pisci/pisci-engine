@@ -217,7 +217,7 @@ async fn execute_todo_turn_inner(
             .as_ref()
             .and_then(|p| p.project_dir.as_ref())
             .filter(|d| !d.trim().is_empty())
-            .map(|d| PathBuf::from(d));
+            .map(PathBuf::from);
     }
 
     if workspace.is_some() {
