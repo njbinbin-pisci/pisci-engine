@@ -97,6 +97,18 @@ pub struct KoiExecResult {
 }
 
 impl KoiExecResult {
+    /// A no-op result returned when a duplicate / concurrent dispatch
+    /// lost the atomic claim. Carries `success = false` but is not a real
+    /// failure — callers that fire-and-forget can ignore it.
+    pub fn skipped(reason: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            reply: reason.into(),
+            result_message_id: None,
+            exit_kind: KoiTurnExit::Cancelled,
+        }
+    }
+
     pub fn to_json(&self) -> Value {
         json!({
             "success": self.success,
@@ -161,7 +173,39 @@ pub async fn execute_todo_turn(
     }
     let canonical_pool_id = pool_session.as_ref().map(|p| p.id.clone());
 
-    claim_and_announce(
+    // Atomic dispatch fence: claim the todo + mark the Koi busy inside a
+    // single write closure. The single-writer DB lock makes "is this todo
+    // free AND is this Koi idle → take both" indivisible, so concurrent
+    // activators (heartbeat, auto-pickup, bootstrap patrol, assign_koi)
+    // cannot double-dispatch the same todo, nor run two turns for one Koi.
+    let claim_id = todo.id.clone();
+    let claim_owner = koi.id.clone();
+    let won_claim = store
+        .write(move |db| {
+            if db.koi_has_other_in_progress_todo(&claim_owner, &claim_id)? {
+                return Ok(false);
+            }
+            let claimed = db.try_claim_koi_todo(&claim_id, &claim_owner)?;
+            if claimed {
+                db.update_koi_status(&claim_owner, "busy")?;
+            }
+            Ok(claimed)
+        })
+        .await?;
+
+    if !won_claim {
+        tracing::info!(
+            target: "pool::coordinator",
+            koi_id = %koi.id,
+            todo_id = %todo.id,
+            "skipping duplicate dispatch: todo already in_progress or Koi busy"
+        );
+        return Ok(KoiExecResult::skipped(
+            "duplicate dispatch skipped: todo already in progress or Koi busy",
+        ));
+    }
+
+    announce_claim(
         store,
         sink.as_ref(),
         &koi,
@@ -171,23 +215,23 @@ pub async fn execute_todo_turn(
     )
     .await?;
 
-    // Mark the Koi as busy in the DB so that monitoring (trials, Piscis,
-    // get_todos koi_status) can observe the running state.
-    {
-        let koi_id = koi.id.clone();
-        store
-            .write(move |db| db.update_koi_status(&koi_id, "busy"))
-            .await?;
-    }
-
     let koi_id_for_restore = koi.id.clone();
     let result =
         execute_todo_turn_inner(store, sink, subagent, cfg, koi, todo, pool_session, args).await;
 
-    // Always restore Koi to idle regardless of success or failure.
+    // Restore the Koi to idle, but only when the board shows no remaining
+    // `in_progress` work for it. Using the board as the source of truth
+    // (instead of an unconditional `idle` write) prevents this turn from
+    // clobbering a `busy` state owned by a concurrent run it cannot see —
+    // e.g. a desktop `call_koi` invocation of the same Koi.
     {
         let _ = store
-            .write(move |db| db.update_koi_status(&koi_id_for_restore, "idle"))
+            .write(move |db| {
+                if !db.koi_has_in_progress_todo(&koi_id_for_restore)? {
+                    db.update_koi_status(&koi_id_for_restore, "idle")?;
+                }
+                Ok(())
+            })
             .await;
     }
 
@@ -387,7 +431,10 @@ fn ensure_pool_allows_runtime_work(pool: &PoolSession, action: &str) -> anyhow::
     )
 }
 
-async fn claim_and_announce(
+/// Emit the post-claim side effects (UI `TodoChanged` snapshot + the
+/// `task_claimed` pool message). The atomic claim itself already happened
+/// in [`execute_todo_turn`]; this only broadcasts it.
+async fn announce_claim(
     store: &PoolStore,
     sink: &dyn PoolEventSink,
     koi: &KoiDefinition,
@@ -395,12 +442,6 @@ async fn claim_and_announce(
     pool_id: Option<&str>,
     assign_msg_id: Option<i64>,
 ) -> anyhow::Result<()> {
-    let claim_id = todo.id.clone();
-    let claim_by = koi.id.clone();
-    store
-        .write(move |db| db.claim_koi_todo(&claim_id, &claim_by))
-        .await?;
-
     // Re-read so the TodoChanged snapshot reflects the claimed_by /
     // claimed_at / status update.
     let todo_id = todo.id.clone();
@@ -824,15 +865,12 @@ pub async fn resume_blocked_todo(
         None => None,
     };
 
-    // Flip the todo back to `in_progress` and (best-effort) post a
-    // resumed marker before dispatching the subagent turn.
-    {
-        let todo_id = todo.id.clone();
-        let owner_id = owner.id.clone();
-        store
-            .write(move |db| db.resume_koi_todo(&todo_id, &owner_id))
-            .await?;
-    }
+    // NOTE: we intentionally do NOT pre-flip the todo to `in_progress`
+    // here. The atomic claim inside `execute_todo_turn` performs the
+    // `blocked|needs_review → in_progress` transition; pre-flipping would
+    // make the claim's `status <> 'in_progress'` guard reject the resume.
+    // The optimistic `TodoChanged(Resumed)` event below keeps the UI
+    // snappy without mutating durable state ahead of the claim.
 
     if let Some(pool) = &pool_session {
         let reminder = format!(

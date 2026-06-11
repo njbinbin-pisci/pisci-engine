@@ -1,3 +1,4 @@
+use super::output::extract_error_lines;
 use crate::agent::tool::{Tool, ToolContext, ToolResult};
 use crate::proc::tokio_command;
 use anyhow::Result;
@@ -147,11 +148,14 @@ impl Tool for CodeRunTool {
                     parts.push("(no output)".to_string());
                 }
 
-                // Annotate common failure patterns to help the LLM triage faster
                 if exit_code != 0 {
                     let combined = format!("{}{}", stdout_raw, stderr_raw);
                     if let Some(hint) = diagnose(&combined, command) {
                         parts.push(format!("--- diagnosis ---\n{}", hint));
+                    }
+                    let errors = extract_error_lines(&stdout_raw, &stderr_raw);
+                    if !errors.is_empty() {
+                        parts.push(format!("--- errors ---\n{}", errors.join("\n")));
                     }
                 }
 

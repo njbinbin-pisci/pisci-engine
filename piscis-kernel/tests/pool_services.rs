@@ -680,6 +680,292 @@ async fn forced_mention_to_busy_koi_queues_todo_without_parallel_dispatch() {
 }
 
 #[tokio::test]
+async fn concurrent_dispatch_of_same_pending_todo_runs_exactly_once() {
+    use piscis_kernel::pool::coordinator::{execute_todo_turn, ExecuteTodoArgs};
+
+    let store = build_store();
+    let sink = make_sink();
+    let pool_id = create_test_pool(&store, &sink).await;
+
+    // A single pending todo owned by an idle Koi.
+    let pool_for_todo = pool_id.clone();
+    let todo = store
+        .write(move |db| {
+            db.create_koi_todo(
+                "koi-alpha",
+                "shared task",
+                "",
+                "medium",
+                "piscis",
+                Some(&pool_for_todo),
+                "koi",
+                None,
+                0,
+            )
+        })
+        .await
+        .expect("create todo");
+
+    // Stub holds each turn open long enough for both dispatchers to overlap.
+    let requests: Arc<StdMutex<Vec<KoiTurnRequest>>> = Arc::new(StdMutex::new(Vec::new()));
+    let requests_cl = requests.clone();
+    let subagent = Arc::new(StubSubagentRuntime::new(move |request| {
+        requests_cl.lock().unwrap().push(request.clone());
+        StubOutcome::Delayed {
+            delay: Duration::from_millis(200),
+            response_text: "done".into(),
+        }
+    })) as Arc<dyn piscis_core::host::SubagentRuntime>;
+    let cfg = CoordinatorConfig::default();
+
+    let short = &todo.id[..8.min(todo.id.len())];
+    let mk_args = || ExecuteTodoArgs {
+        koi_id: "koi-alpha".into(),
+        todo_id: todo.id.clone(),
+        assign_msg_id: None,
+        session_id: format!("koi_task_koi-alpha_{}", short),
+        extra_tool_profile: Vec::new(),
+        extra_system_context: None,
+    };
+
+    // Two concurrent dispatchers race on the same pending todo.
+    let (a, b) = tokio::join!(
+        execute_todo_turn(&store, sink_arc(&sink), subagent.clone(), &cfg, mk_args()),
+        execute_todo_turn(&store, sink_arc(&sink), subagent.clone(), &cfg, mk_args()),
+    );
+    let a = a.expect("turn a");
+    let b = b.expect("turn b");
+
+    // Exactly one real subagent turn was spawned; the loser was fenced out.
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        1,
+        "the same pending todo must not be dispatched twice concurrently"
+    );
+    assert!(
+        a.success ^ b.success,
+        "exactly one dispatcher should have run the turn (a.success={}, b.success={})",
+        a.success,
+        b.success
+    );
+}
+
+#[tokio::test]
+async fn concurrent_dispatch_of_two_todos_for_one_idle_koi_serializes() {
+    use piscis_kernel::pool::coordinator::{execute_todo_turn, ExecuteTodoArgs};
+
+    let store = build_store();
+    let sink = make_sink();
+    let pool_id = create_test_pool(&store, &sink).await;
+
+    // Two distinct pending todos, both owned by the same idle Koi.
+    let pool_a = pool_id.clone();
+    let todo_a = store
+        .write(move |db| {
+            db.create_koi_todo(
+                "koi-alpha",
+                "task a",
+                "",
+                "medium",
+                "piscis",
+                Some(&pool_a),
+                "koi",
+                None,
+                0,
+            )
+        })
+        .await
+        .expect("create todo a");
+    let pool_b = pool_id.clone();
+    let todo_b = store
+        .write(move |db| {
+            db.create_koi_todo(
+                "koi-alpha",
+                "task b",
+                "",
+                "medium",
+                "piscis",
+                Some(&pool_b),
+                "koi",
+                None,
+                0,
+            )
+        })
+        .await
+        .expect("create todo b");
+
+    // Stub holds each turn open so both dispatchers overlap in time.
+    let requests: Arc<StdMutex<Vec<KoiTurnRequest>>> = Arc::new(StdMutex::new(Vec::new()));
+    let requests_cl = requests.clone();
+    let subagent = Arc::new(StubSubagentRuntime::new(move |request| {
+        requests_cl.lock().unwrap().push(request.clone());
+        StubOutcome::Delayed {
+            delay: Duration::from_millis(150),
+            response_text: "done".into(),
+        }
+    })) as Arc<dyn piscis_core::host::SubagentRuntime>;
+    let cfg = CoordinatorConfig::default();
+
+    let args = |todo: &piscis_core::models::KoiTodo| ExecuteTodoArgs {
+        koi_id: "koi-alpha".into(),
+        todo_id: todo.id.clone(),
+        assign_msg_id: None,
+        session_id: format!("koi_task_koi-alpha_{}", &todo.id[..8.min(todo.id.len())]),
+        extra_tool_profile: Vec::new(),
+        extra_system_context: None,
+    };
+
+    let _ = tokio::join!(
+        execute_todo_turn(
+            &store,
+            sink_arc(&sink),
+            subagent.clone(),
+            &cfg,
+            args(&todo_a)
+        ),
+        execute_todo_turn(
+            &store,
+            sink_arc(&sink),
+            subagent.clone(),
+            &cfg,
+            args(&todo_b)
+        ),
+    );
+
+    // The Koi is single-threaded: while one turn is in flight the other
+    // dispatch is fenced out, so only one subagent turn starts.
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        1,
+        "a single Koi must never run two turns concurrently"
+    );
+}
+
+#[tokio::test]
+async fn koi_has_in_progress_todo_tracks_board_state() {
+    let store = build_store();
+    let sink = make_sink();
+    let pool_id = create_test_pool(&store, &sink).await;
+
+    // No work yet → not busy by board.
+    let busy0 = store
+        .read(|db| db.koi_has_in_progress_todo("koi-alpha"))
+        .await
+        .expect("query");
+    assert!(!busy0, "koi with no todos is not board-busy");
+
+    let pool_for_todo = pool_id.clone();
+    let todo = store
+        .write(move |db| {
+            db.create_koi_todo(
+                "koi-alpha",
+                "t",
+                "",
+                "medium",
+                "piscis",
+                Some(&pool_for_todo),
+                "koi",
+                None,
+                0,
+            )
+        })
+        .await
+        .expect("create todo");
+
+    // Pending todo (status='todo') is not in_progress.
+    let busy1 = store
+        .read(|db| db.koi_has_in_progress_todo("koi-alpha"))
+        .await
+        .expect("query");
+    assert!(!busy1, "a pending (todo) row is not board-busy");
+
+    let claim_id = todo.id.clone();
+    store
+        .write(move |db| db.claim_koi_todo(&claim_id, "koi-alpha"))
+        .await
+        .expect("claim");
+    let busy2 = store
+        .read(|db| db.koi_has_in_progress_todo("koi-alpha"))
+        .await
+        .expect("query");
+    assert!(busy2, "an in_progress row makes the Koi board-busy");
+
+    let done_id = todo.id.clone();
+    store
+        .write(move |db| db.complete_koi_todo(&done_id, None))
+        .await
+        .expect("complete");
+    let busy3 = store
+        .read(|db| db.koi_has_in_progress_todo("koi-alpha"))
+        .await
+        .expect("query");
+    assert!(!busy3, "a completed row no longer keeps the Koi board-busy");
+}
+
+#[tokio::test]
+async fn finished_turn_restores_koi_to_idle_when_board_is_clear() {
+    use piscis_kernel::pool::coordinator::{execute_todo_turn, ExecuteTodoArgs};
+
+    let store = build_store();
+    let sink = make_sink();
+    let pool_id = create_test_pool(&store, &sink).await;
+
+    let pool_for_todo = pool_id.clone();
+    let todo = store
+        .write(move |db| {
+            db.create_koi_todo(
+                "koi-alpha",
+                "solo task",
+                "",
+                "medium",
+                "piscis",
+                Some(&pool_for_todo),
+                "koi",
+                None,
+                0,
+            )
+        })
+        .await
+        .expect("create todo");
+
+    let subagent = Arc::new(StubSubagentRuntime::always_complete("done"))
+        as Arc<dyn piscis_core::host::SubagentRuntime>;
+    let cfg = CoordinatorConfig::default();
+
+    execute_todo_turn(
+        &store,
+        sink_arc(&sink),
+        subagent,
+        &cfg,
+        ExecuteTodoArgs {
+            koi_id: "koi-alpha".into(),
+            todo_id: todo.id.clone(),
+            assign_msg_id: None,
+            session_id: format!("koi_task_koi-alpha_{}", &todo.id[..8.min(todo.id.len())]),
+            extra_tool_profile: Vec::new(),
+            extra_system_context: None,
+        },
+    )
+    .await
+    .expect("turn");
+
+    // Board has no remaining in_progress work → board-aware restore idles it.
+    let status = store
+        .read(|db| {
+            Ok(db
+                .get_koi("koi-alpha")?
+                .map(|k| k.status)
+                .unwrap_or_default())
+        })
+        .await
+        .expect("read status");
+    assert_eq!(
+        status, "idle",
+        "Koi must return to idle after its only turn finishes"
+    );
+}
+
+#[tokio::test]
 async fn forced_all_mention_creates_todos_and_dispatches_each_koi() {
     let store = build_store();
     let sink = make_sink();

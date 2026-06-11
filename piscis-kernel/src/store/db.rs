@@ -3614,6 +3614,56 @@ impl Database {
         Ok(())
     }
 
+    /// Atomic, conditional claim used to fence concurrent dispatchers.
+    ///
+    /// Succeeds (returns `true`) only when the todo is **not already
+    /// `in_progress`** — i.e. no other turn is currently running it. The
+    /// single-writer DB lock makes the check-and-set atomic, so when
+    /// several activators (heartbeat, auto-pickup, bootstrap patrol,
+    /// `assign_koi`) race on the same pending todo exactly one wins and
+    /// the rest observe `false` and skip.
+    pub fn try_claim_koi_todo(&self, id: &str, claimed_by: &str) -> Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        let affected = self.conn.execute(
+            "UPDATE koi_todos SET claimed_by = ?2, claimed_at = ?3, status = 'in_progress', \
+             blocked_reason = NULL, updated_at = ?3 \
+             WHERE id = ?1 AND status <> 'in_progress'",
+            params![id, claimed_by, now],
+        )?;
+        Ok(affected == 1)
+    }
+
+    /// True when `koi_id` already owns a different `in_progress` todo.
+    /// Used together with [`try_claim_koi_todo`] inside one write closure
+    /// to enforce single-turn-per-Koi serialization across concurrent
+    /// dispatch passes.
+    pub fn koi_has_other_in_progress_todo(
+        &self,
+        koi_id: &str,
+        except_todo_id: &str,
+    ) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM koi_todos \
+             WHERE owner_id = ?1 AND status = 'in_progress' AND id <> ?2",
+            params![koi_id, except_todo_id],
+            |r| r.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// True when `koi_id` owns any `in_progress` todo. Used as the
+    /// board-derived half of the "is this Koi busy?" decision so that
+    /// status writes from different dispatch paths (kernel coordinator,
+    /// desktop `call_koi`) don't clobber each other.
+    pub fn koi_has_in_progress_todo(&self, koi_id: &str) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM koi_todos WHERE owner_id = ?1 AND status = 'in_progress'",
+            params![koi_id],
+            |r| r.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     /// Block a todo with a reason
     pub fn block_koi_todo(&self, id: &str, reason: &str) -> Result<()> {
         let now = Utc::now().to_rfc3339();

@@ -11,13 +11,14 @@ const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
 const UTF16_LE_BOM: &[u8] = &[0xFF, 0xFE];
 const UTF16_BE_BOM: &[u8] = &[0xFE, 0xFF];
 
-/// Decode raw file bytes to a String.
+/// Decode raw file bytes to a String (also used by file_edit).
+///
 /// Priority:
-///   1. Strip UTF-8 BOM if present, decode as UTF-8.
-///   2. Try UTF-8 (no BOM).
-///   3. Try GBK/GB18030 (common on Chinese Windows systems).
-///   4. Lossy UTF-8 as last resort.
-fn decode_bytes(bytes: &[u8]) -> (String, &'static str) {
+/// 1. Strip UTF-8 BOM if present, decode as UTF-8.
+/// 2. Try UTF-8 (no BOM).
+/// 3. Try GBK/GB18030 (common on Chinese Windows systems).
+/// 4. Lossy UTF-8 as last resort.
+pub fn decode_bytes(bytes: &[u8]) -> (String, &'static str) {
     // UTF-16 LE/BE — convert via encoding_rs
     if bytes.starts_with(UTF16_LE_BOM) {
         let (cow, _, had_errors) = encoding_rs::UTF_16LE.decode(&bytes[UTF16_LE_BOM.len()..]);
@@ -57,6 +58,43 @@ fn decode_bytes(bytes: &[u8]) -> (String, &'static str) {
 
     // Last resort: lossy UTF-8
     (String::from_utf8_lossy(bytes).into_owned(), "utf-8-lossy")
+}
+
+/// Build a structural outline (functions, classes, etc.) with line numbers.
+fn build_file_outline(content: &str) -> String {
+    let mut lines_out: Vec<String> = Vec::new();
+    for (i, line) in content.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with('#') {
+            continue;
+        }
+        let is_symbol = trimmed.starts_with("pub fn")
+            || trimmed.starts_with("fn ")
+            || trimmed.starts_with("async fn")
+            || trimmed.starts_with("pub async fn")
+            || trimmed.starts_with("pub struct")
+            || trimmed.starts_with("struct ")
+            || trimmed.starts_with("pub enum")
+            || trimmed.starts_with("enum ")
+            || trimmed.starts_with("impl ")
+            || trimmed.starts_with("pub trait")
+            || trimmed.starts_with("trait ")
+            || trimmed.starts_with("class ")
+            || trimmed.starts_with("export class")
+            || trimmed.starts_with("export function")
+            || trimmed.starts_with("function ")
+            || trimmed.starts_with("def ")
+            || trimmed.starts_with("type ")
+            || trimmed.starts_with("interface ");
+        if is_symbol {
+            lines_out.push(format!("{:6}|{}", i + 1, trimmed));
+        }
+    }
+    if lines_out.is_empty() {
+        "  (no outline symbols detected — use offset/limit to read content)".to_string()
+    } else {
+        lines_out.join("\n")
+    }
 }
 
 pub struct FileReadTool;
@@ -100,6 +138,11 @@ impl Tool for FileReadTool {
                 "limit": {
                     "type": "integer",
                     "description": "Maximum number of lines to read. Omit to read the whole file (up to 256KB)."
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["content", "outline"],
+                    "description": "content (default): numbered lines. outline: symbol list with line numbers only."
                 }
             },
             "required": ["path"]
@@ -145,10 +188,10 @@ impl Tool for FileReadTool {
         };
 
         if !path.exists() {
-            // Try to suggest similar files
-            return Ok(ToolResult::err(format!(
-                "File not found: {}",
-                path.display()
+            return Ok(ToolResult::err(crate::tools::output::format_err(
+                crate::tools::output::ToolErrorCode::FileNotFound,
+                &format!("File not found: {}", path.display()),
+                "Use file_list or file_search glob to verify the path.",
             )));
         }
 
@@ -193,15 +236,7 @@ impl Tool for FileReadTool {
 
         let offset = input["offset"].as_u64().unwrap_or(1).max(1) as usize;
         let limit = input["limit"].as_u64().map(|l| l as usize);
-
-        // For large files, only reject if no offset/limit is specified
-        if metadata.len() > MAX_TEXT_BYTES && limit.is_none() && offset <= 1 {
-            return Ok(ToolResult::err(format!(
-                "File too large ({} bytes, max {} bytes). Use offset/limit parameters to read in chunks. \
-                 Example: offset=1, limit=200 reads the first 200 lines.",
-                metadata.len(), MAX_TEXT_BYTES
-            )));
-        }
+        let mode = input["mode"].as_str().unwrap_or("content");
 
         let raw = std::fs::read(&path).map_err(|e| {
             let hint = if e.kind() == std::io::ErrorKind::PermissionDenied {
@@ -225,6 +260,50 @@ impl Tool for FileReadTool {
             String::new()
         };
 
+        if mode == "outline" {
+            let outline = build_file_outline(&content);
+            return Ok(ToolResult::ok(format!(
+                "Outline: {}{} ({} bytes)\n\n{}",
+                path.display(),
+                encoding_note,
+                metadata.len(),
+                outline
+            )));
+        }
+
+        // Large file without chunk params: outline + preview instead of hard reject.
+        if metadata.len() > MAX_TEXT_BYTES && limit.is_none() && offset <= 1 {
+            let lines: Vec<&str> = content.lines().collect();
+            let preview_end = 100.min(lines.len());
+            let preview: String = lines[..preview_end]
+                .iter()
+                .enumerate()
+                .map(|(i, line)| format!("{:6}|{}", i + 1, line))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let outline = build_file_outline(&content);
+            let hint = format!(
+                "file_read path={} offset={} limit=200",
+                path_str,
+                preview_end + 1
+            );
+            return Ok(ToolResult::ok_with_meta(
+                format!(
+                    "File too large for full read ({} bytes). Outline + first {} lines:\n\n--- outline ---\n{}\n\n--- preview ---\n{}",
+                    metadata.len(),
+                    preview_end,
+                    outline,
+                    preview
+                ),
+                crate::tools::output::ToolMeta {
+                    truncated: true,
+                    total_bytes: metadata.len() as usize,
+                    shown_bytes: preview.len(),
+                    hint: Some(hint),
+                },
+            ));
+        }
+
         let lines: Vec<&str> = content.lines().collect();
         let total = lines.len();
         let start = (offset - 1).min(total);
@@ -240,7 +319,17 @@ impl Tool for FileReadTool {
             .collect::<Vec<_>>()
             .join("\n");
 
-        Ok(ToolResult::ok(format!(
+        let mut hint = None;
+        if end < total {
+            hint = Some(format!(
+                "file_read path={} offset={} limit={}",
+                path_str,
+                end + 1,
+                limit.unwrap_or(200)
+            ));
+        }
+
+        let body = format!(
             "File: {}{} ({} lines total, showing lines {}-{})\n\n{}",
             path.display(),
             encoding_note,
@@ -248,6 +337,20 @@ impl Tool for FileReadTool {
             start + 1,
             end,
             numbered
-        )))
+        );
+
+        if hint.is_some() {
+            Ok(ToolResult::ok_with_meta(
+                body,
+                crate::tools::output::ToolMeta {
+                    truncated: end < total,
+                    total_bytes: content.len(),
+                    shown_bytes: numbered.len(),
+                    hint,
+                },
+            ))
+        } else {
+            Ok(ToolResult::ok(body))
+        }
     }
 }

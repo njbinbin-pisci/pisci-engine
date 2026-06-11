@@ -1,5 +1,5 @@
 [workspace]
-members = ["piscis-core", "piscis-kernel", "piscis-cli"]
+members = ["piscis-core", "piscis-kernel", "piscis-cli", "piscis-ide-tools"]
 resolver = "2"
 
 # Workspace-wide lint policy. `cargo clippy --workspace` will treat all of
@@ -33,6 +33,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 piscis-core = { path = "piscis-core" }
 piscis-kernel = { path = "piscis-kernel" }
 piscis-cli = { path = "piscis-cli" }
+piscis-ide-tools = { path = "piscis-ide-tools" }
 
 [profile.dev]
 incremental = true

@@ -481,10 +481,7 @@ mod tests {
             },
         ];
         let out = sanitize_tool_use_result_pairing(msgs);
-        let tool_use_ids: Vec<String> = out
-            .iter()
-            .flat_map(collect_tool_use_ids)
-            .collect();
+        let tool_use_ids: Vec<String> = out.iter().flat_map(collect_tool_use_ids).collect();
         assert_eq!(tool_use_ids, vec!["call_a"]);
         assert!(out.iter().any(|msg| {
             matches!(

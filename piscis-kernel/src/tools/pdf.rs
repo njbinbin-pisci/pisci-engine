@@ -189,6 +189,7 @@ fn resolve(raw: &str, workspace: &Path) -> PathBuf {
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn require_path(input: &Value, workspace: &Path) -> Result<PathBuf, ToolResult> {
     match input["path"].as_str() {
         Some(s) => Ok(resolve(s, workspace)),
@@ -196,6 +197,7 @@ fn require_path(input: &Value, workspace: &Path) -> Result<PathBuf, ToolResult> 
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn require_output(input: &Value, workspace: &Path) -> Result<PathBuf, ToolResult> {
     match input["output"].as_str() {
         Some(s) => Ok(resolve(s, workspace)),

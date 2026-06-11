@@ -1,3 +1,6 @@
+use super::output::{
+    collapse_repeated_lines, extract_error_lines, smart_truncate, TruncateStrategy,
+};
 use crate::agent::tool::{Tool, ToolContext, ToolResult};
 use crate::proc::tokio_command;
 use anyhow::Result;
@@ -308,15 +311,23 @@ impl Tool for ShellTool {
                 }
 
                 // Build a clear, structured result the LLM can parse
-                let mut parts = vec![format!("Exit code: {}", exit_code)];
-                if !stdout.is_empty() {
-                    parts.push(format!("STDOUT:\n{}", stdout));
+                let stdout_raw = collapse_repeated_lines(&stdout);
+                let stderr_raw = collapse_repeated_lines(&stderr);
+                let mut parts = vec![format!("[exit: {}]", exit_code)];
+                if !stdout_raw.is_empty() {
+                    parts.push(format!("STDOUT:\n{}", stdout_raw));
                 }
-                if !stderr.is_empty() {
-                    parts.push(format!("STDERR:\n{}", stderr));
+                if !stderr_raw.is_empty() {
+                    parts.push(format!("STDERR:\n{}", stderr_raw));
                 }
                 if stdout.is_empty() && stderr.is_empty() {
                     parts.push("(no output)".to_string());
+                }
+                if exit_code != 0 {
+                    let errors = extract_error_lines(&stdout, &stderr);
+                    if !errors.is_empty() {
+                        parts.push(format!("--- errors ---\n{}", errors.join("\n")));
+                    }
                 }
 
                 // Always ok — let the LLM read exit code and decide
@@ -449,17 +460,10 @@ fn is_permission_error(exit_code: i32, stdout: &str, stderr: &str) -> bool {
 }
 
 fn truncate_output(s: &str, max_bytes: usize) -> String {
-    let s = s.trim();
-    if s.len() <= max_bytes {
-        return s.to_string();
-    }
-    let half = max_bytes / 2;
-    let start = &s[..half];
-    let end = &s[s.len() - half..];
-    format!(
-        "{}\n\n... [{} bytes truncated] ...\n\n{}",
-        start,
-        s.len() - max_bytes,
-        end
-    )
+    let strategy = if s.contains("error") || s.contains("Error") || s.contains("FAILED") {
+        TruncateStrategy::ErrorAware
+    } else {
+        TruncateStrategy::HeadTail
+    };
+    smart_truncate(s.trim(), max_bytes, strategy).0
 }

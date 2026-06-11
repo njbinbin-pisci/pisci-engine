@@ -208,6 +208,8 @@ impl FileSearchTool {
             true
         });
 
+        matches.sort_by_key(|p| p.matches('/').count() + p.matches('\\').count());
+
         if matches.is_empty() {
             return Ok(ToolResult::ok(format!(
                 "No files found matching '{}' under {}",
@@ -261,6 +263,7 @@ impl FileSearchTool {
         });
 
         let mut results: Vec<String> = Vec::new();
+        let mut skipped: Vec<String> = Vec::new();
         let mut total_matches = 0usize;
 
         walk_dir(root, 0, max_depth, &mut |path: &Path| {
@@ -295,6 +298,11 @@ impl FileSearchTool {
                 Err(_) => return true,
             };
             if meta.len() > MAX_CONTENT_BYTES as u64 * 4 {
+                skipped.push(format!(
+                    "[skipped: {} ({:.0}KB)]",
+                    path.display(),
+                    meta.len() as f64 / 1024.0
+                ));
                 return true;
             }
 
@@ -314,7 +322,7 @@ impl FileSearchTool {
                     let line_num = i + 1;
                     if context_lines == 0 {
                         file_matches.push(format!(
-                            "  {}:{}: {}",
+                            "  {}:{}:{}",
                             path.display(),
                             line_num,
                             line.trim_end()
@@ -340,6 +348,8 @@ impl FileSearchTool {
 
             if !file_matches.is_empty() {
                 total_matches += file_matches.len();
+                let rel = path.to_string_lossy();
+                results.push(format!("{}:", rel));
                 results.extend(file_matches);
             }
 
@@ -360,13 +370,18 @@ impl FileSearchTool {
             )));
         }
 
-        Ok(ToolResult::ok(format!(
+        let mut body = format!(
             "Found {} match(es) for '{}' under {}:\n{}",
             total_matches,
             pattern,
             root.display(),
             results.join("\n")
-        )))
+        );
+        if !skipped.is_empty() {
+            body.push_str("\n\nSkipped large files:\n");
+            body.push_str(&skipped.join("\n"));
+        }
+        Ok(ToolResult::ok(body))
     }
 }
 

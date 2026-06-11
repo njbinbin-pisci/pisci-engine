@@ -2,6 +2,7 @@
 /// Critical for workflows like: start an app → wait for it to load → use uia to interact.
 ///
 /// Cross-platform: PowerShell on Windows, pgrep/pkill/ps/kill on Linux/macOS.
+use super::output::{smart_truncate, TruncateStrategy};
 use crate::agent::tool::{Tool, ToolContext, ToolResult};
 use crate::proc::tokio_command;
 use anyhow::Result;
@@ -154,14 +155,18 @@ impl ProcessControlTool {
                 ))),
                 Ok(Err(e)) => Ok(ToolResult::err(format!("Failed to start process: {}", e))),
                 Ok(Ok(output)) => {
-                    let stdout = truncate(
+                    let stdout = smart_truncate(
                         &String::from_utf8_lossy(&output.stdout),
                         MAX_OUTPUT_BYTES * 3 / 4,
-                    );
-                    let stderr = truncate(
+                        TruncateStrategy::HeadTail,
+                    )
+                    .0;
+                    let stderr = smart_truncate(
                         &String::from_utf8_lossy(&output.stderr),
                         MAX_OUTPUT_BYTES / 4,
-                    );
+                        TruncateStrategy::HeadTail,
+                    )
+                    .0;
                     let exit_code = output.status.code().unwrap_or(-1);
                     let mut parts = vec![format!("Exit code: {}", exit_code)];
                     if !stdout.is_empty() {
@@ -575,17 +580,4 @@ async fn run_ps(command: &str) -> Result<String> {
     } else {
         Ok(stdout)
     }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    let s = s.trim();
-    if s.len() <= max {
-        return s.to_string();
-    }
-    let half = max / 2;
-    format!(
-        "{}\n...[truncated]...\n{}",
-        &s[..half],
-        &s[s.len() - half..]
-    )
 }

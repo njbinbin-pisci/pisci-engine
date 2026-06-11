@@ -19,6 +19,7 @@ pub mod file_search;
 pub mod file_write;
 pub mod mcp;
 pub mod memory_tool;
+pub mod output;
 pub mod pdf;
 pub mod plan_todo;
 pub mod plan_write;
@@ -30,6 +31,7 @@ pub mod shell;
 pub mod ssh;
 pub mod user_tool;
 pub mod vision_context;
+pub mod web_fetch;
 pub mod web_search;
 
 use crate::agent::plan::PlanStore;
@@ -140,6 +142,9 @@ pub fn register_neutral_into(registry: &mut ToolRegistry, cfg: &NeutralToolsConf
     }
     if cfg.is_enabled("web_search") {
         registry.register(Box::new(web_search::WebSearchTool));
+    }
+    if cfg.is_enabled("web_fetch") {
+        registry.register(Box::new(web_fetch::WebFetchTool));
     }
     if cfg.is_enabled("email") {
         registry.register(Box::new(email::EmailTool));

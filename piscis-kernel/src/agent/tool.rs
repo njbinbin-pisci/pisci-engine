@@ -106,6 +106,8 @@ pub struct ToolResult {
     pub is_error: bool,
     /// Optional image data (screenshot etc.) passed to Vision AI
     pub image: Option<ImageData>,
+    /// Optional structured metadata (truncation hints, etc.)
+    pub meta: Option<crate::tools::output::ToolMeta>,
 }
 
 impl ToolResult {
@@ -114,6 +116,15 @@ impl ToolResult {
             content: content.into(),
             is_error: false,
             image: None,
+            meta: None,
+        }
+    }
+    pub fn ok_with_meta(content: impl Into<String>, meta: crate::tools::output::ToolMeta) -> Self {
+        Self {
+            content: content.into(),
+            is_error: false,
+            image: None,
+            meta: Some(meta),
         }
     }
     pub fn err(content: impl Into<String>) -> Self {
@@ -121,6 +132,7 @@ impl ToolResult {
             content: content.into(),
             is_error: true,
             image: None,
+            meta: None,
         }
     }
     pub fn with_image(mut self, image: ImageData) -> Self {

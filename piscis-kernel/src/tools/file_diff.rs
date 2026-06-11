@@ -3,6 +3,11 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use super::output::{format_err, ToolErrorCode};
+
+const MAX_DIFF_BYTES: u64 = 500 * 1024;
+const MAX_DIFF_LINES: usize = 5000;
+
 pub struct FileDiffTool;
 
 #[async_trait]
@@ -111,6 +116,19 @@ impl Tool for FileDiffTool {
                      or (path_a + path_b) for compare mode",
                 ));
             };
+
+        let total_bytes = content_a.len() + content_b.len();
+        let total_lines = content_a.lines().count() + content_b.lines().count();
+        if total_bytes as u64 > MAX_DIFF_BYTES || total_lines > MAX_DIFF_LINES {
+            return Ok(ToolResult::err(format_err(
+                ToolErrorCode::OutputTooLarge,
+                &format!(
+                    "Files too large for in-memory diff ({} bytes, {} lines). Limit: {} bytes / {} lines.",
+                    total_bytes, total_lines, MAX_DIFF_BYTES, MAX_DIFF_LINES
+                ),
+                "Use file_read with offset/limit on smaller regions, or shell with git diff.",
+            )));
+        }
 
         let diff = unified_diff(&content_a, &content_b, &label_a, &label_b, context_lines);
 

@@ -4,6 +4,9 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::borrow::Cow;
 
+use super::file_read::decode_bytes;
+use super::output::{format_err, ToolErrorCode};
+
 const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
 
 /// Return true if the file starts with a UTF-8 BOM.
@@ -18,7 +21,20 @@ fn file_has_utf8_bom(path: &std::path::Path) -> bool {
     false
 }
 
-/// Write content to a file, prepending a UTF-8 BOM if `preserve_bom` is true.
+/// Write content preserving UTF-8 BOM and detected source encoding.
+fn write_preserving_encoding(
+    path: &std::path::Path,
+    content: &str,
+    encoding: &str,
+    preserve_bom: bool,
+) -> std::io::Result<()> {
+    if encoding == "gbk" {
+        let (bytes, _, _) = encoding_rs::GBK.encode(content);
+        return std::fs::write(path, &*bytes);
+    }
+    write_with_bom_policy(path, content, preserve_bom)
+}
+
 fn write_with_bom_policy(
     path: &std::path::Path,
     content: &str,
@@ -243,15 +259,15 @@ impl Tool for FileEditTool {
         };
 
         if !path.exists() {
-            return Ok(ToolResult::err(format!(
-                "File not found: {}",
-                path.display()
+            return Ok(ToolResult::err(format_err(
+                ToolErrorCode::FileNotFound,
+                &format!("File not found: {}", path.display()),
+                "Verify the path with file_list or file_search.",
             )));
         }
 
         // Build the list of (old, new) pairs from either mode
         let pairs: Vec<(String, String)> = if let Some(edits_arr) = input["edits"].as_array() {
-            // Batch mode
             if edits_arr.is_empty() {
                 return Ok(ToolResult::err("edits array is empty"));
             }
@@ -275,7 +291,6 @@ impl Tool for FileEditTool {
             }
             pairs
         } else {
-            // Single-edit mode (backward compatible)
             let old_str =
                 match input["old_string"].as_str() {
                     Some(s) if !s.is_empty() => s.to_string(),
@@ -297,14 +312,9 @@ impl Tool for FileEditTool {
 
         let raw = std::fs::read(&path)?;
         let preserve_bom = raw.starts_with(UTF8_BOM);
-        let content = if preserve_bom {
-            String::from_utf8_lossy(&raw[UTF8_BOM.len()..]).into_owned()
-        } else {
-            String::from_utf8_lossy(&raw).into_owned()
-        };
+        let (content, encoding) = decode_bytes(&raw);
         let lines_before = content.lines().count();
 
-        // Validation pass: every old_string must appear exactly once
         for (i, (old, _)) in pairs.iter().enumerate() {
             let count = content.matches(old.as_str()).count();
             if count == 0 {
@@ -313,10 +323,10 @@ impl Tool for FileEditTool {
                 } else {
                     format!("edits[{}].old_string", i)
                 };
-                return Ok(ToolResult::err(format!(
-                    "{} not found in file: {}",
-                    label,
-                    path.display()
+                return Ok(ToolResult::err(format_err(
+                    ToolErrorCode::MatchNotFound,
+                    &format!("{} not found in file: {}", label, path.display()),
+                    "Re-read the file with file_read and copy an exact unique snippet.",
                 )));
             }
             if count > 1 {
@@ -325,16 +335,19 @@ impl Tool for FileEditTool {
                 } else {
                     format!("edits[{}].old_string", i)
                 };
-                return Ok(ToolResult::err(format!(
-                    "{} appears {} times in file (must appear exactly once): {}",
-                    label,
-                    count,
-                    path.display()
+                return Ok(ToolResult::err(format_err(
+                    ToolErrorCode::MatchAmbiguous,
+                    &format!(
+                        "{} appears {} times in file (must appear exactly once): {}",
+                        label,
+                        count,
+                        path.display()
+                    ),
+                    "Include more surrounding lines in old_string to make it unique.",
                 )));
             }
         }
 
-        // Check for duplicate old_strings within the batch (would cause offset confusion)
         for i in 0..pairs.len() {
             for j in (i + 1)..pairs.len() {
                 if pairs[i].0 == pairs[j].0 {
@@ -346,22 +359,20 @@ impl Tool for FileEditTool {
             }
         }
 
-        // Apply pass: find each old_string's byte offset, sort descending, replace back-to-front
-        // to keep earlier offsets valid after each replacement.
-        let mut offsets: Vec<(usize, usize, usize)> = Vec::with_capacity(pairs.len()); // (byte_start, pair_idx, old_len)
+        let mut offsets: Vec<(usize, usize, usize)> = Vec::with_capacity(pairs.len());
         for (idx, (old, _)) in pairs.iter().enumerate() {
             if let Some(pos) = content.find(old.as_str()) {
                 offsets.push((pos, idx, old.len()));
             }
         }
-        offsets.sort_by_key(|o| std::cmp::Reverse(o.0)); // descending by position
+        offsets.sort_by_key(|o| std::cmp::Reverse(o.0));
 
         let mut result = content.clone();
         for (pos, pair_idx, old_len) in offsets {
             result.replace_range(pos..pos + old_len, &pairs[pair_idx].1);
         }
 
-        write_with_bom_policy(&path, &result, preserve_bom)?;
+        write_preserving_encoding(&path, &result, encoding, preserve_bom)?;
 
         let lines_after = result.lines().count();
         let line_delta = lines_after as i64 - lines_before as i64;
@@ -373,20 +384,22 @@ impl Tool for FileEditTool {
 
         if pairs.len() == 1 {
             Ok(ToolResult::ok(format!(
-                "Edited file: {} ({} chars → {} chars, {} lines {})",
+                "Edited file: {} ({} chars → {} chars, {} lines {}, encoding: {})",
                 path.display(),
                 pairs[0].0.len(),
                 pairs[0].1.len(),
                 lines_after,
-                delta_str
+                delta_str,
+                encoding
             )))
         } else {
             Ok(ToolResult::ok(format!(
-                "Edited file: {} ({} replacements applied, {} lines {})",
+                "Edited file: {} ({} replacements applied, {} lines {}, encoding: {})",
                 path.display(),
                 pairs.len(),
                 lines_after,
-                delta_str
+                delta_str,
+                encoding
             )))
         }
     }
