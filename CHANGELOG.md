@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.8.60] - 2026-06-13
+
+### Fixed
+
+- **`is_allowed_plan_path`**: cross-platform plan path validation on Windows/macOS (no longer requires the target file to exist; avoids `canonicalize` prefix mismatches).
+
 ## [0.8.59] - 2026-06-12
 
 ### Added

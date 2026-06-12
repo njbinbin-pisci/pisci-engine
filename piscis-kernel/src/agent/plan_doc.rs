@@ -35,16 +35,40 @@ pub fn resolve_plan_path(workspace_root: &Path, rel_or_abs: &str) -> PathBuf {
 
 /// Returns true when `path` resolves to `{workspace}/.agentz/plans/*.md`.
 pub fn is_allowed_plan_path(workspace_root: &Path, rel_or_abs: &str) -> bool {
-    let resolved = resolve_plan_path(workspace_root, rel_or_abs);
-    let canonical_root = workspace_root
-        .canonicalize()
-        .unwrap_or_else(|_| workspace_root.to_path_buf());
-    let canonical = resolved.canonicalize().unwrap_or(resolved);
-    let plans = canonical_root.join(PLANS_DIR);
-    if !canonical.starts_with(&plans) {
+    let p = Path::new(rel_or_abs);
+    let rel: &Path = if p.is_absolute() {
+        if let Ok(r) = p.strip_prefix(workspace_root) {
+            r
+        } else {
+            let root = workspace_root
+                .canonicalize()
+                .unwrap_or_else(|_| workspace_root.to_path_buf());
+            let abs = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+            match abs.strip_prefix(&root) {
+                Ok(r) => return rel_plan_under_plans(r),
+                Err(_) => return false,
+            }
+        }
+    } else {
+        p
+    };
+    rel_plan_under_plans(rel)
+}
+
+fn rel_plan_under_plans(rel: &Path) -> bool {
+    if rel
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
         return false;
     }
-    matches!(canonical.extension().and_then(|e| e.to_str()), Some("md"))
+    let mut it = rel.components();
+    match (it.next(), it.next()) {
+        (Some(std::path::Component::Normal(a)), Some(std::path::Component::Normal(b)))
+            if a == ".agentz" && b == "plans" => {}
+        _ => return false,
+    }
+    matches!(rel.extension().and_then(|e| e.to_str()), Some("md"))
 }
 
 /// Starter template injected when the agent creates a new plan file.
