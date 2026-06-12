@@ -1131,6 +1131,8 @@ pub async fn assign_koi(
         let sink = sink.clone();
         let cfg = cfg.clone();
         let koi_id_clone = koi_id.clone();
+        let koi_name_clone = koi_name.clone();
+        let pool_id_for_spawn = session.id.clone();
         let todo_id = todo.id.clone();
         let todo_for_dep = todo.clone();
         let msg_id = msg.id;
@@ -1151,6 +1153,33 @@ pub async fn assign_koi(
                     depends_on = ?todo_for_dep.depends_on,
                     "assign_koi: waiting on depends_on before dispatch"
                 );
+                let todo_snap = piscis_core::host::TodoSnapshot::from(&todo_for_dep);
+                let deps = todo_for_dep.depends_on.clone().unwrap_or_default();
+                let notice = format!(
+                    "Waiting for upstream todo {} before dispatching {}",
+                    deps, koi_name_clone
+                );
+                sink.emit_pool(&PoolEvent::TodoChanged {
+                    pool_id: pool_id_for_spawn.clone(),
+                    action: TodoChangeAction::Updated,
+                    todo: todo_snap,
+                });
+                let pool_id = pool_id_for_spawn.clone();
+                let todo_id_ref = todo_for_dep.id.clone();
+                let _ = store
+                    .write(move |db| {
+                        db.insert_pool_message_ext(
+                            &pool_id,
+                            "piscis",
+                            &notice,
+                            "system",
+                            "{}",
+                            Some(&todo_id_ref),
+                            None,
+                            Some("dependency_waiting"),
+                        )
+                    })
+                    .await;
                 return;
             }
             let args = coordinator::ExecuteTodoArgs {

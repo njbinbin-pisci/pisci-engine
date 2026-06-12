@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.8.59] - 2026-06-12
+
+### Added
+
+- **`pool_sessions.team_id` / `workflow_run_id`**：按团队与工作流 run 隔离 pool；`find_active_pool(project_dir, team_id, team_name)`。
+- **`assign_koi` dependency waiting**：依赖未满足时 emit `TodoChanged` + `dependency_waiting` pool message。
+
+### Changed
+
+- **`pool_org` 工具描述**：补充 workflow_hint 与 depends_on 语义说明。
+
 ## [0.8.55] - 2026-06-06
 
 ### Fixed

@@ -816,6 +816,8 @@ impl Database {
             // any) IM conversation originally requested this pool so the
             // heartbeat / decision flow can fan out beyond the desktop UI.
             "ALTER TABLE pool_sessions ADD COLUMN origin_im_binding_key TEXT",
+            "ALTER TABLE pool_sessions ADD COLUMN team_id TEXT",
+            "ALTER TABLE pool_sessions ADD COLUMN workflow_run_id TEXT",
         ] {
             let _ = self.conn.execute(col, []);
         }
@@ -3821,13 +3823,32 @@ impl Database {
         project_dir: Option<&str>,
         task_timeout_secs: u32,
     ) -> Result<piscis_core::models::PoolSession> {
+        self.create_pool_session_with_meta(name, project_dir, task_timeout_secs, None, None)
+    }
+
+    pub fn create_pool_session_with_meta(
+        &self,
+        name: &str,
+        project_dir: Option<&str>,
+        task_timeout_secs: u32,
+        team_id: Option<&str>,
+        workflow_run_id: Option<&str>,
+    ) -> Result<piscis_core::models::PoolSession> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now();
         let now_str = now.to_rfc3339();
         self.conn.execute(
-            "INSERT INTO pool_sessions (id, name, org_spec, status, project_dir, task_timeout_secs, last_active_at, created_at, updated_at) \
-             VALUES (?1, ?2, '', 'active', ?3, ?4, ?5, ?5, ?5)",
-            params![id, name, project_dir, task_timeout_secs, now_str],
+            "INSERT INTO pool_sessions (id, name, org_spec, status, project_dir, task_timeout_secs, last_active_at, created_at, updated_at, team_id, workflow_run_id) \
+             VALUES (?1, ?2, '', 'active', ?3, ?4, ?5, ?5, ?5, ?6, ?7)",
+            params![
+                id,
+                name,
+                project_dir,
+                task_timeout_secs,
+                now_str,
+                team_id.filter(|s| !s.trim().is_empty()),
+                workflow_run_id.filter(|s| !s.trim().is_empty()),
+            ],
         )?;
         Ok(piscis_core::models::PoolSession {
             id,
@@ -3838,6 +3859,10 @@ impl Database {
             task_timeout_secs,
             origin_im_binding_key: None,
             member_koi_ids: Vec::new(),
+            team_id: team_id.filter(|s| !s.trim().is_empty()).map(String::from),
+            workflow_run_id: workflow_run_id
+                .filter(|s| !s.trim().is_empty())
+                .map(String::from),
             last_active_at: Some(now),
             created_at: now,
             updated_at: now,
@@ -3857,6 +3882,8 @@ impl Database {
             origin_im_binding_key: r.get::<_, Option<String>>(6).ok().flatten(),
             // Hydrated separately by list/get callers; see hydrate_members.
             member_koi_ids: Vec::new(),
+            team_id: r.get::<_, Option<String>>(10).ok().flatten(),
+            workflow_run_id: r.get::<_, Option<String>>(11).ok().flatten(),
             last_active_at: r
                 .get::<_, Option<String>>(7)?
                 .and_then(|s| s.parse::<DateTime<Utc>>().ok()),
@@ -3882,7 +3909,7 @@ impl Database {
 
     pub fn list_pool_sessions(&self) -> Result<Vec<piscis_core::models::PoolSession>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, org_spec, status, project_dir, task_timeout_secs, origin_im_binding_key, last_active_at, created_at, updated_at \
+            "SELECT id, name, org_spec, status, project_dir, task_timeout_secs, origin_im_binding_key, last_active_at, created_at, updated_at, team_id, workflow_run_id \
              FROM pool_sessions ORDER BY updated_at DESC"
         )?;
         let rows = stmt.query_map([], Self::map_pool_session)?;
@@ -3895,7 +3922,7 @@ impl Database {
 
     pub fn get_pool_session(&self, id: &str) -> Result<Option<piscis_core::models::PoolSession>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, org_spec, status, project_dir, task_timeout_secs, origin_im_binding_key, last_active_at, created_at, updated_at \
+            "SELECT id, name, org_spec, status, project_dir, task_timeout_secs, origin_im_binding_key, last_active_at, created_at, updated_at, team_id, workflow_run_id \
              FROM pool_sessions WHERE id = ?1"
         )?;
         let mut rows = stmt.query_map(params![id], Self::map_pool_session)?;
@@ -3917,7 +3944,7 @@ impl Database {
         }
         let like = format!("{}%", prefix);
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, org_spec, status, project_dir, task_timeout_secs, origin_im_binding_key, last_active_at, created_at, updated_at \
+            "SELECT id, name, org_spec, status, project_dir, task_timeout_secs, origin_im_binding_key, last_active_at, created_at, updated_at, team_id, workflow_run_id \
              FROM pool_sessions WHERE id LIKE ?1 ORDER BY updated_at DESC"
         )?;
         let rows = stmt.query_map(params![like], Self::map_pool_session)?;
@@ -3952,6 +3979,53 @@ impl Database {
             1 => Ok(matches.into_iter().next()),
             _ => Err(anyhow::anyhow!("Pool identifier '{}' is ambiguous", value)),
         }
+    }
+
+    /// Find a non-archived pool for a team within a project directory.
+    /// Prefers explicit `team_id` match; falls back to legacy rows with NULL
+    /// `team_id` matched by pool name (pre-migration compat).
+    pub fn find_active_pool(
+        &self,
+        project_dir: &str,
+        team_id: &str,
+        team_name: &str,
+    ) -> Result<Option<piscis_core::models::PoolSession>> {
+        let dir = project_dir.trim();
+        let tid = team_id.trim();
+        let name = team_name.trim();
+        if dir.is_empty() || tid.is_empty() {
+            return Ok(None);
+        }
+        let pools: Vec<_> = self
+            .list_pool_sessions()?
+            .into_iter()
+            .filter(|p| {
+                p.status != "archived"
+                    && p.workflow_run_id.is_none()
+                    && p.project_dir
+                        .as_deref()
+                        .map(|d| d.trim() == dir)
+                        .unwrap_or(false)
+            })
+            .collect();
+        if let Some(p) = pools
+            .iter()
+            .find(|p| p.team_id.as_deref() == Some(tid))
+            .cloned()
+        {
+            return Ok(Some(p));
+        }
+        // Legacy: team_id unset but name matches the team template.
+        if !name.is_empty() {
+            if let Some(p) = pools
+                .iter()
+                .find(|p| p.team_id.is_none() && p.name == name)
+                .cloned()
+            {
+                return Ok(Some(p));
+            }
+        }
+        Ok(None)
     }
 
     pub fn normalize_identifier_references(&self) -> Result<u32> {

@@ -125,7 +125,8 @@ impl Tool for PoolOrgTool {
          Only call 'create' if no existing pool covers the requested work — \
          if an active or paused pool is related, add tasks to it instead of creating a new pool. \
          After creating a new pool, Piscis must use 'assign_koi' to kick off work, then call 'wait_for_koi' before judging progress. Piscis does not use pool_chat directly. When todos are done, Piscis must explicitly review and merge incrementally via 'merge_branches' (optionally branch=...) or request rework; Koi completion alone is not final delivery. Use depends_on on assign_koi/create_todo to serialize waves when org_spec requires upstream merge before downstream work. \
-         During heartbeat/routine checks: NEVER create new pools — only manage existing ones."
+         During heartbeat/routine checks: NEVER create new pools — only manage existing ones. \
+         Team workflow hints (waves / sequential / review) are enforced via org_spec plus depends_on on assign_koi/create_todo — use depends_on to serialize waves when the org_spec or team hint requires upstream work before downstream dispatch."
     }
 
     fn input_schema(&self) -> Value {

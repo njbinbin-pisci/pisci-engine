@@ -50,6 +50,13 @@ pub struct PoolSession {
     /// store on list/get; defaults to empty when not hydrated.
     #[serde(default)]
     pub member_koi_ids: Vec<String>,
+    /// Owning swarm/workflow team slug (AgentZ `team.json` id). Used to
+    /// isolate pools so same-named teams with different ids do not share state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_id: Option<String>,
+    /// When set, this pool backs a single workflow run transcript.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_run_id: Option<String>,
     pub last_active_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
