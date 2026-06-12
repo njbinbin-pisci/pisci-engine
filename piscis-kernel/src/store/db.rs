@@ -1776,6 +1776,33 @@ impl Database {
             .map_err(Into::into)
     }
 
+    /// List artifacts across all sessions, newest first (for global "My Files").
+    pub fn list_all_artifacts(&self, limit: i64) -> Result<Vec<SessionArtifact>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, name, artifact_type, uri, content_summary, source_tool, tool_use_id, metadata_json, created_at \
+             FROM session_artifacts ORDER BY rowid DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit.max(1)], |r| {
+            Ok(SessionArtifact {
+                id: r.get(0)?,
+                session_id: r.get(1)?,
+                name: r.get(2)?,
+                artifact_type: r.get(3)?,
+                uri: r.get(4)?,
+                content_summary: r.get(5)?,
+                source_tool: r.get(6)?,
+                tool_use_id: r.get(7)?,
+                metadata_json: r.get(8)?,
+                created_at: r
+                    .get::<_, String>(9)?
+                    .parse::<DateTime<Utc>>()
+                    .unwrap_or_else(|_| Utc::now()),
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     // ------------------------------------------------------------------
     // Memories
     // ------------------------------------------------------------------
